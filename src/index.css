@@ -5,3 +5,36 @@
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
+@keyframes ttRgbLedPulse {
+  0% {
+    border-color: #ff1744;
+    box-shadow: 0 0 18px 4px rgba(255, 23, 68, 0.95), 0 0 38px 9px rgba(255, 23, 68, 0.72), inset 0 0 14px rgba(255, 255, 255, 0.8);
+  }
+  20% {
+    border-color: #ffea00;
+    box-shadow: 0 0 18px 4px rgba(255, 234, 0, 0.95), 0 0 38px 9px rgba(255, 234, 0, 0.72), inset 0 0 14px rgba(255, 255, 255, 0.8);
+  }
+  40% {
+    border-color: #00ff88;
+    box-shadow: 0 0 18px 4px rgba(0, 255, 136, 0.95), 0 0 38px 9px rgba(0, 255, 136, 0.72), inset 0 0 14px rgba(255, 255, 255, 0.8);
+  }
+  60% {
+    border-color: #00e5ff;
+    box-shadow: 0 0 18px 4px rgba(0, 229, 255, 0.95), 0 0 38px 9px rgba(0, 229, 255, 0.72), inset 0 0 14px rgba(255, 255, 255, 0.8);
+  }
+  80% {
+    border-color: #d500f9;
+    box-shadow: 0 0 18px 4px rgba(213, 0, 249, 0.95), 0 0 38px 9px rgba(213, 0, 249, 0.72), inset 0 0 14px rgba(255, 255, 255, 0.8);
+  }
+  100% {
+    border-color: #ff1744;
+    box-shadow: 0 0 18px 4px rgba(255, 23, 68, 0.95), 0 0 38px 9px rgba(255, 23, 68, 0.72), inset 0 0 14px rgba(255, 255, 255, 0.8);
+  }
+}
+
+.tt-rgb-led-active {
+  outline: 3px solid #ffffff !important;
+  outline-offset: 2px !important;
+  filter: brightness(1.68) saturate(2.25) contrast(1.16) !important;
+  animation: ttRgbLedPulse 0.28s linear infinite !important;
+}

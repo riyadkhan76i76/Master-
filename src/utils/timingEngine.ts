@@ -139,6 +139,8 @@ export interface SubMsRetryOptions {
   onExhausted?: (reason: string, attempts: number, elapsedMs: number) => void;
 }
 
+export const AUTO_LEAD_MULTIPLIER_PRESETS = [1, 2, 3, 5, 6, 8, 10, 12] as const;
+
 const MAX_PRETRIG_LEAD_MS = 30_000;
 const AUTO_LEAD_MIN_ROUNDS = 2;
 const AUTO_LEAD_MAX_ROUNDS = 12;
@@ -487,27 +489,29 @@ export class TimingCalibrationEngine {
     const key = tag.trim() || 'DEFAULT';
     const ov = this.tagOverrides.get(key);
     const rec = this.calibratedTags.get(key);
+    const computeScaledForMult = (mult: number): number => {
+      const base = rec
+        ? Math.max(rec.medianDeficitMs, rec.measuredServerAcceptMs, 60) +
+          (this.autoHumanProfile.enabled ? Math.round(this.autoHumanProfile.avgHumanSpanMs) : 0)
+        : 90;
+      return Math.min(MAX_PRETRIG_LEAD_MS, Math.max(15, Math.round(base * (mult / 3) * 1.15)));
+    };
     if (ov) {
       if (ov.mode === 'manual_ms') {
         return { mode: 'manual_ms', multiplier: ov.multiplier, leadMs: ov.manualMs };
       }
       if (ov.mode === 'manual_mult') {
-        const base = rec && rec.recommendedLeadMs > 0
-          ? Math.max(45, rec.measuredServerAcceptMs + (this.autoHumanProfile.enabled ? Math.round(this.autoHumanProfile.avgHumanSpanMs) : 0))
-          : 90;
-        const scaled = Math.min(MAX_PRETRIG_LEAD_MS, Math.max(15, Math.round(base * (ov.multiplier / 3) * 1.15)));
-        return { mode: 'manual_mult', multiplier: ov.multiplier, leadMs: rec?.recommendedLeadMs || scaled };
+        return { mode: 'manual_mult', multiplier: ov.multiplier, leadMs: computeScaledForMult(ov.multiplier) };
       }
     }
     if (this.globalLeadMode === 'manual_ms') {
       return { mode: 'manual_ms', multiplier: this.globalLeadMultiplier, leadMs: this.globalManualLeadMs };
     }
     if (this.globalLeadMode === 'manual_mult') {
-      const base = rec ? Math.max(45, rec.measuredServerAcceptMs + (this.autoHumanProfile.enabled ? Math.round(this.autoHumanProfile.avgHumanSpanMs) : 0)) : 90;
       return {
         mode: 'manual_mult',
         multiplier: this.globalLeadMultiplier,
-        leadMs: Math.min(MAX_PRETRIG_LEAD_MS, Math.max(15, Math.round(base * (this.globalLeadMultiplier / 3) * 1.15))),
+        leadMs: computeScaledForMult(this.globalLeadMultiplier),
       };
     }
     return {
@@ -590,8 +594,12 @@ export class TimingCalibrationEngine {
       );
       p.lastAdaptationReason = `${feedback.outcome}${feedback.errText ? ` (${feedback.errText.slice(0, 32)})` : ''} -> auto-widened hold ${p.holdMinMs}-${p.holdMaxMs}ms, pre ${p.preDownMinMs}-${p.preDownMaxMs}ms`;
 
-      // Auto-compensate calibrated Pre-Trigger leads so wider human click still beats crash
+      // Auto-compensate calibrated Pre-Trigger leads so wider human click still beats crash (never overwrite manual_ms)
       for (const [k, rec] of this.calibratedTags.entries()) {
+        const effMode = this.tagOverrides.get(k)?.mode ?? rec.mode;
+        if (effMode === 'manual_ms' || (effMode === 'auto' && this.globalLeadMode === 'manual_ms' && !this.tagOverrides.has(k))) {
+          continue;
+        }
         const compLead = Math.min(
           MAX_PRETRIG_LEAD_MS,
           Math.max(rec.recommendedLeadMs, Math.round(rec.recommendedLeadMs + p.avgHumanSpanMs * 0.55)),

@@ -100,6 +100,10 @@
     predictivePreTriggerEnabled: true,
     predictivePreTriggerLeadMs: 100,
     autoLead3xEnabled: true,
+    clickEnabled: true,
+    globalLeadMode: 'auto',
+    globalLeadMultiplier: 3,
+    tagLeadOverrides: {},
     histTagPredMinSamples: 2,
     histTagPredMinConfidence: 60
   };
@@ -108,6 +112,7 @@
   const AUTO_LEAD_MAX_ROUNDS = 12;
   const AUTO_LEAD_MULTIPLIER = 3;
   const AUTO_LEAD_MAX_MULTIPLIER = 16;
+  const LEAD_MULTIPLIER_PRESETS = [1, 2, 3, 5, 6, 8, 10, 12];
 
   const BOT_BASE_URL = (CFG.relayUrl || '').replace(/\/+$/, '');
   const SHARED_BASE_URL = (BOT_BASE_URL.includes('ais-dev-')
@@ -778,6 +783,23 @@
       const savedAuto3x = sessionStorage.getItem('__tt_auto_lead_3x');
       if (savedAuto3x === '1') CFG.autoLead3xEnabled = true;
       else if (savedAuto3x === '0') CFG.autoLead3xEnabled = false;
+      const savedClickOn = sessionStorage.getItem('__tt_click_enabled');
+      if (savedClickOn === '1') CFG.clickEnabled = true;
+      else if (savedClickOn === '0') CFG.clickEnabled = false;
+      const savedLeadMode = sessionStorage.getItem('__tt_global_lead_mode');
+      if (savedLeadMode === 'auto' || savedLeadMode === 'manual_mult' || savedLeadMode === 'manual_ms') {
+        CFG.globalLeadMode = savedLeadMode;
+        CFG.autoLead3xEnabled = savedLeadMode !== 'manual_ms';
+      }
+      const savedLeadMult = sessionStorage.getItem('__tt_global_lead_mult');
+      if (savedLeadMult !== null && savedLeadMult !== '' && !isNaN(Number(savedLeadMult))) {
+        CFG.globalLeadMultiplier = Math.max(1, Math.min(AUTO_LEAD_MAX_MULTIPLIER, Math.round(Number(savedLeadMult))));
+      }
+      const savedTagOv = sessionStorage.getItem('__tt_tag_lead_overrides');
+      if (savedTagOv) {
+        const parsedOv = JSON.parse(savedTagOv);
+        if (parsedOv && typeof parsedOv === 'object' && !Array.isArray(parsedOv)) CFG.tagLeadOverrides = parsedOv;
+      }
     } catch {}
     if (typeof GM_getValue === 'function' || (typeof GM !== 'undefined' && typeof GM.getValue === 'function')) {
       const applyGmPredCfg = (raw) => {
@@ -792,6 +814,19 @@
           }
           if (typeof o.autoLead3xEnabled === 'boolean' && sessionStorage.getItem('__tt_auto_lead_3x') === null) {
             CFG.autoLead3xEnabled = o.autoLead3xEnabled;
+          }
+          if (typeof o.clickEnabled === 'boolean' && sessionStorage.getItem('__tt_click_enabled') === null) {
+            CFG.clickEnabled = o.clickEnabled;
+          }
+          if ((o.globalLeadMode === 'auto' || o.globalLeadMode === 'manual_mult' || o.globalLeadMode === 'manual_ms') && sessionStorage.getItem('__tt_global_lead_mode') === null) {
+            CFG.globalLeadMode = o.globalLeadMode;
+            CFG.autoLead3xEnabled = o.globalLeadMode !== 'manual_ms';
+          }
+          if (typeof o.globalLeadMultiplier === 'number' && sessionStorage.getItem('__tt_global_lead_mult') === null) {
+            CFG.globalLeadMultiplier = Math.max(1, Math.min(AUTO_LEAD_MAX_MULTIPLIER, Math.round(o.globalLeadMultiplier)));
+          }
+          if (o.tagLeadOverrides && typeof o.tagLeadOverrides === 'object' && !Array.isArray(o.tagLeadOverrides) && sessionStorage.getItem('__tt_tag_lead_overrides') === null) {
+            CFG.tagLeadOverrides = Object.assign({}, o.tagLeadOverrides);
           }
           const rawLeadVal = typeof o.predictiveLeadTimeMs === 'number'
             ? o.predictiveLeadTimeMs
@@ -830,6 +865,9 @@
   } catch {}
   function persistHudControlState() {
     const safeLeadMs = Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Math.round(Number(CFG.predictivePreTriggerLeadMs != null ? CFG.predictivePreTriggerLeadMs : 100))));
+    const safeLeadMode = (CFG.globalLeadMode === 'manual_mult' || CFG.globalLeadMode === 'manual_ms') ? CFG.globalLeadMode : 'auto';
+    const safeLeadMult = Math.max(1, Math.min(AUTO_LEAD_MAX_MULTIPLIER, Math.round(Number(CFG.globalLeadMultiplier) || 3)));
+    const safeTagOverrides = (CFG.tagLeadOverrides && typeof CFG.tagLeadOverrides === 'object') ? CFG.tagLeadOverrides : {};
     try { localStorage.setItem('__tt_locked', locked ? '1' : '0'); } catch {}
     try { sessionStorage.setItem('__tt_armed', CFG.armed ? '1' : '0'); } catch {}
     try { sessionStorage.setItem('__tt_round_once', CFG.roundOnce ? '1' : '0'); } catch {}
@@ -846,6 +884,10 @@
     try { sessionStorage.setItem('__tt_pre_trig_on', CFG.predictivePreTriggerEnabled !== false ? '1' : '0'); } catch {}
     try { sessionStorage.setItem('__tt_pre_trig_lead', String(safeLeadMs)); } catch {}
     try { sessionStorage.setItem('__tt_auto_lead_3x', CFG.autoLead3xEnabled !== false ? '1' : '0'); } catch {}
+    try { sessionStorage.setItem('__tt_click_enabled', CFG.clickEnabled !== false ? '1' : '0'); } catch {}
+    try { sessionStorage.setItem('__tt_global_lead_mode', safeLeadMode); } catch {}
+    try { sessionStorage.setItem('__tt_global_lead_mult', String(safeLeadMult)); } catch {}
+    try { sessionStorage.setItem('__tt_tag_lead_overrides', JSON.stringify(safeTagOverrides)); } catch {}
     if (typeof GM_setValue === 'function' || (typeof GM !== 'undefined' && typeof GM.setValue === 'function')) {
       try {
         gmSetSafe('__tt_state_' + CFG.roomId, JSON.stringify({
@@ -862,6 +904,10 @@
           predictivePreTriggerLeadMs: safeLeadMs,
           predictiveLeadTimeMs: safeLeadMs,
           autoLead3xEnabled: Boolean(CFG.autoLead3xEnabled !== false),
+          clickEnabled: Boolean(CFG.clickEnabled !== false),
+          globalLeadMode: safeLeadMode,
+          globalLeadMultiplier: safeLeadMult,
+          tagLeadOverrides: safeTagOverrides,
           histTagPredMinSamples: Math.max(1, Math.min(20, Math.round(Number(CFG.histTagPredMinSamples) || 2))),
           histTagPredMinConfidence: Math.max(10, Math.min(100, Math.round(Number(CFG.histTagPredMinConfidence) || 60))),
           targetX: typeof targetX === 'number' ? Math.round(targetX) : undefined,
@@ -2698,7 +2744,7 @@
     const tagToClickMs = Math.max(0, Math.round(Number(opts && opts.tagToClickMs) || 0));
     const tagAfterMs = Math.max(0, Math.round(Number(opts && opts.tagAfterCrashMs) || 0));
     const crashAfterMs = Math.max(0, Math.round(Number(opts && opts.crashAfterClickMs) || 0));
-    const mult = Math.max(3, Math.min(AUTO_LEAD_MAX_MULTIPLIER, Number(opts && opts.appliedMultiplier) || 3));
+    const mult = Math.max(1, Math.min(AUTO_LEAD_MAX_MULTIPLIER, Number(opts && opts.appliedMultiplier) || 3));
     const nextLead = Math.max(0, Math.round(Number(opts && opts.appliedLeadMs) || 0));
     const hasOutCash = Boolean(opts && opts.hasOutCash);
     const btnWasLive = Boolean(opts && opts.btnWasLiveInRound);
@@ -2916,6 +2962,100 @@
     }
   }
 
+  function normalizeLeadMode(m) {
+    if (m === 'manual_mult' || m === 'manual_ms' || m === 'auto') return m;
+    return CFG.autoLead3xEnabled === false ? 'manual_ms' : 'auto';
+  }
+
+  function normalizeMultPreset(v) {
+    const n = Math.max(1, Math.min(AUTO_LEAD_MAX_MULTIPLIER, Math.round(Number(v) || 3)));
+    return n;
+  }
+
+  function getTagLeadOverride(tag, altRule) {
+    const map = CFG.tagLeadOverrides;
+    if (!map || typeof map !== 'object') return null;
+    if (tag && map[tag] && typeof map[tag] === 'object') return map[tag];
+    if (altRule && map[altRule] && typeof map[altRule] === 'object') return map[altRule];
+    const resolved = resolveAutoLeadTagKey(tag || altRule);
+    if (resolved && map[resolved] && typeof map[resolved] === 'object') return map[resolved];
+    return null;
+  }
+
+  function computeMultLeadMs(rec, multVal) {
+    const mult = normalizeMultPreset(multVal);
+    const rttNow = Math.max(0, Number(typeof rollingServerRttMs === 'number' ? rollingServerRttMs : 0) || 0);
+    const humanCompMs = CFG.autoHumanClick !== false ? Math.round(autoHumanState.avgSpanMs || 38) : 0;
+    const base = rec
+      ? Math.max(rec.medianDeficitMs || 0, rec.serverAcceptMs || 0, rttNow, 60) + humanCompMs
+      : Math.max(90, rttNow + humanCompMs);
+    return Math.max(15, Math.min(MAX_PRETRIG_LEAD_MS, Math.round(base * (mult / 3) * 1.15)));
+  }
+
+  function setGlobalLeadConfig(mode, val) {
+    const nextMode = normalizeLeadMode(mode);
+    CFG.globalLeadMode = nextMode;
+    CFG.autoLead3xEnabled = nextMode !== 'manual_ms';
+    if (nextMode === 'manual_mult') {
+      const m = normalizeMultPreset(val != null ? val : CFG.globalLeadMultiplier);
+      CFG.globalLeadMultiplier = m;
+      const activeRules = parseTagList((typeof elTags !== 'undefined' && elTags && elTags.value) || CFG.tags || '');
+      const rec = activeRules.length ? getAutoLeadRecordForTag(activeRules[0]) : null;
+      const computed = computeMultLeadMs(rec, m);
+      CFG.predictivePreTriggerLeadMs = computed;
+      CFG.predictiveLeadTimeMs = computed;
+      lastAutoLeadStatusNote = '🔒 Manual ' + m + 'x → -' + computed + 'ms';
+    } else if (nextMode === 'manual_ms') {
+      const ms = Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Math.round(Number(val != null ? val : CFG.predictivePreTriggerLeadMs) || 100)));
+      CFG.predictivePreTriggerLeadMs = ms;
+      CFG.predictiveLeadTimeMs = ms;
+      lastAutoLeadStatusNote = '✎ Manual -' + ms + 'ms';
+    } else {
+      const activeRules = parseTagList((typeof elTags !== 'undefined' && elTags && elTags.value) || CFG.tags || '');
+      if (activeRules.length) {
+        const rec = getAutoLeadRecordForTag(activeRules[0]);
+        if (rec) recomputeTagAutoLeadStats(rec, true);
+      }
+    }
+    lastUserCfgEditAt = Date.now();
+    persistHudControlState();
+    if (typeof markUserTouched === 'function') markUserTouched();
+    if (typeof syncUI === 'function' && !hudHidden) syncUI();
+    if (typeof syncTurboCfg === 'function') syncTurboCfg(true, true);
+    if (CFG.armed && CFG.predictivePreTriggerEnabled !== false && CFG.histTagPredEnabled !== false && !hudHidden && (currentRoundStartMono > lastTagRoundEndMono || currentFlightStartMono > lastTagRoundEndMono)) {
+      maybeSchedulePredictivePreTrigger(performance.now());
+    }
+    if (typeof activeTab !== 'undefined' && activeTab === 'tags' && typeof renderLogs === 'function') renderLogs(true);
+    return { mode: CFG.globalLeadMode, multiplier: CFG.globalLeadMultiplier, leadMs: CFG.predictivePreTriggerLeadMs };
+  }
+
+  function setTagLeadOverride(tag, mode, val) {
+    const cleanTag = String(tag || '').trim();
+    if (!cleanTag) return null;
+    if (!CFG.tagLeadOverrides || typeof CFG.tagLeadOverrides !== 'object') CFG.tagLeadOverrides = {};
+    if (!mode || mode === 'global' || mode === 'clear') {
+      delete CFG.tagLeadOverrides[cleanTag];
+    } else {
+      const nMode = normalizeLeadMode(mode);
+      const ov = { mode: nMode };
+      if (nMode === 'manual_mult') ov.multiplier = normalizeMultPreset(val != null ? val : CFG.globalLeadMultiplier);
+      if (nMode === 'manual_ms') ov.manualMs = Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Math.round(Number(val != null ? val : getEffectiveLeadMsForTag(cleanTag)) || 100)));
+      CFG.tagLeadOverrides[cleanTag] = ov;
+      const rec = getAutoLeadRecordForTag(cleanTag);
+      if (rec) recomputeTagAutoLeadStats(rec, true);
+    }
+    lastUserCfgEditAt = Date.now();
+    persistHudControlState();
+    if (typeof markUserTouched === 'function') markUserTouched();
+    if (typeof syncUI === 'function' && !hudHidden) syncUI();
+    if (typeof syncTurboCfg === 'function') syncTurboCfg(true, true);
+    if (CFG.armed && CFG.predictivePreTriggerEnabled !== false && CFG.histTagPredEnabled !== false && !hudHidden && (currentRoundStartMono > lastTagRoundEndMono || currentFlightStartMono > lastTagRoundEndMono)) {
+      maybeSchedulePredictivePreTrigger(performance.now());
+    }
+    if (typeof activeTab !== 'undefined' && activeTab === 'tags' && typeof renderLogs === 'function') renderLogs(true);
+    return CFG.tagLeadOverrides[cleanTag] || null;
+  }
+
   function recomputeTagAutoLeadStats(rec, allowApply) {
     if (!rec) return false;
     rec.roundCount = rec.samples.length;
@@ -2956,7 +3096,11 @@
     rec.winPct = scoredRounds > 0 ? Math.round((okCnt / scoredRounds) * 1000) / 10 : null;
     rec.lastOutcome = rec.samples.length ? rec.samples[rec.samples.length - 1].outcome : '';
 
+    const tagOv = getTagLeadOverride(rec.tag);
+    const effMode = tagOv ? normalizeLeadMode(tagOv.mode) : normalizeLeadMode(CFG.globalLeadMode);
+
     const applyAutoLeadSettingsToCfg = (leadMs, srvAcceptMs, reasonLogTitle, reasonLogDesc) => {
+      if (effMode === 'manual_ms' || normalizeLeadMode(CFG.globalLeadMode) === 'manual_ms') return false;
       let changed = false;
       if (Math.round(Number(CFG.predictivePreTriggerLeadMs) || 0) !== leadMs) {
         CFG.predictivePreTriggerLeadMs = leadMs;
@@ -2981,6 +3125,47 @@
       }
       return changed;
     };
+
+    if (effMode === 'manual_ms') {
+      const m = Math.floor(lateDefs.length / 2);
+      rec.medianDeficitMs = lateDefs.length ? Number(((lateDefs.length % 2 === 1) ? lateDefs[m] : ((lateDefs[m - 1] + lateDefs[m]) / 2)).toFixed(1)) : 0;
+      const fixedMs = (tagOv && typeof tagOv.manualMs === 'number')
+        ? Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Math.round(tagOv.manualMs)))
+        : Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Math.round(Number(CFG.predictivePreTriggerLeadMs) || 100)));
+      rec.appliedLeadMs = fixedMs;
+      rec.recommendedLeadMs = fixedMs;
+      rec.calibrated = true;
+      rec.lastReason = '✎ Manual Lead: -' + fixedMs + 'ms';
+      return false;
+    }
+
+    if (effMode === 'manual_mult') {
+      const m = Math.floor(lateDefs.length / 2);
+      const med = lateDefs.length ? ((lateDefs.length % 2 === 1) ? lateDefs[m] : ((lateDefs[m - 1] + lateDefs[m]) / 2)) : 0;
+      rec.medianDeficitMs = Number(med.toFixed(1));
+      const fixedMult = normalizeMultPreset(tagOv && typeof tagOv.multiplier === 'number' ? tagOv.multiplier : CFG.globalLeadMultiplier);
+      const multLead = computeMultLeadMs(rec, fixedMult);
+      rec.appliedMultiplier = fixedMult;
+      rec.recommendedLeadMs = multLead;
+      rec.appliedLeadMs = multLead;
+      rec.calibrated = true;
+      const shortTag = rec.tag.length > 22 ? (rec.tag.slice(0, 22) + '…') : rec.tag;
+      lastAutoLeadStatusNote = '🔒 ' + fixedMult + 'x [' + shortTag + '] → ' + multLead + 'ms';
+      rec.lastReason = lastAutoLeadStatusNote;
+      if (allowApply && CFG.autoLead3xEnabled !== false) {
+        const activeRules = parseTagList((typeof elTags !== 'undefined' && elTags && elTags.value) || CFG.tags || '');
+        const isCurrentTag = !activeRules.length || activeRules.some((r) => r === rec.tag || rec.tag.indexOf(r) !== -1 || r.indexOf(rec.tag) !== -1);
+        if (isCurrentTag) {
+          return applyAutoLeadSettingsToCfg(
+            multLead,
+            rec.serverAcceptMs || rttNow,
+            'Manual ' + fixedMult + 'x [' + shortTag + ']',
+            multLead + 'ms lead'
+          );
+        }
+      }
+      return false;
+    }
 
     if (lateDefs.length >= 1) {
       const m = Math.floor(lateDefs.length / 2);
@@ -3142,8 +3327,22 @@
 
   function getEffectiveLeadMsForTag(tag, altRule) {
     const fallbackLead = Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Number(CFG.predictivePreTriggerLeadMs != null ? CFG.predictivePreTriggerLeadMs : 100)));
-    if (CFG.autoLead3xEnabled === false) return fallbackLead;
     const rec = getAutoLeadRecordForTag(tag, altRule);
+    const ov = getTagLeadOverride(tag, altRule);
+    if (ov) {
+      if (ov.mode === 'manual_ms' && typeof ov.manualMs === 'number') {
+        return Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Math.round(ov.manualMs)));
+      }
+      if (ov.mode === 'manual_mult' && typeof ov.multiplier === 'number') {
+        return computeMultLeadMs(rec, ov.multiplier);
+      }
+      if (ov.mode === 'auto' && rec && rec.calibrated && typeof rec.appliedLeadMs === 'number' && rec.appliedLeadMs > 0) {
+        return Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Math.round(rec.appliedLeadMs)));
+      }
+    }
+    const gMode = normalizeLeadMode(CFG.globalLeadMode);
+    if (gMode === 'manual_ms' || CFG.autoLead3xEnabled === false) return fallbackLead;
+    if (gMode === 'manual_mult') return computeMultLeadMs(rec, CFG.globalLeadMultiplier);
     if (rec && rec.calibrated && typeof rec.appliedLeadMs === 'number' && rec.appliedLeadMs > 0) {
       return Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Math.round(rec.appliedLeadMs)));
     }
@@ -3750,7 +3949,7 @@
     if (typeof recordTagMatchLed === 'function') recordTagMatchLed(String(sched.tag || ''), 'PRED-PRE', 'PRE');
     fireTargetClick(predLbl, preTriggerFiredAtMono);
 
-    const badPreClick = Boolean(lastDomClickMeta && isButtonAlreadyEnded(lastDomClickMeta.preText, lastDomClickMeta.disabled));
+    const badPreClick = Boolean(CFG.clickEnabled !== false && !(lastDomClickMeta && lastDomClickMeta.dryRun) && lastDomClickMeta && isButtonAlreadyEnded(lastDomClickMeta.preText, lastDomClickMeta.disabled));
     if (badPreClick) {
       const badPreTxt = (lastDomClickMeta && lastDomClickMeta.preText) ? String(lastDomClickMeta.preText).trim() : 'OFF';
       const badDis = Boolean(lastDomClickMeta && lastDomClickMeta.disabled);
@@ -4037,6 +4236,9 @@
           histEnabled: Boolean(CFG.histTagPredEnabled !== false),
           preTriggerEnabled: Boolean(CFG.predictivePreTriggerEnabled !== false),
           autoLead3xEnabled: Boolean(CFG.autoLead3xEnabled !== false),
+          leadMode: normalizeLeadMode(CFG.globalLeadMode),
+          leadMultiplier: normalizeMultPreset(CFG.globalLeadMultiplier),
+          tagOverrides: Object.assign({}, CFG.tagLeadOverrides || {}),
           leadMs: safeLeadMs,
           predictiveLeadTimeMs: safeLeadMs,
           minSamples: Math.max(1, Number(CFG.histTagPredMinSamples) || 2),
@@ -4049,6 +4251,15 @@
           autoLeadTrackedTags: tagAutoLeadMap.size
         };
       },
+      getLeadConfig: () => ({
+        globalMode: normalizeLeadMode(CFG.globalLeadMode),
+        globalMultiplier: normalizeMultPreset(CFG.globalLeadMultiplier),
+        manualLeadMs: Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Number(CFG.predictivePreTriggerLeadMs != null ? CFG.predictivePreTriggerLeadMs : 100))),
+        tagOverrides: Object.assign({}, CFG.tagLeadOverrides || {}),
+        effectiveLeadMsFor: (tag) => getEffectiveLeadMsForTag(tag)
+      }),
+      setGlobalLeadConfig: (mode, val) => setGlobalLeadConfig(mode, val),
+      setTagLeadOverride: (tag, mode, val) => setTagLeadOverride(tag, mode, val),
       getAutoLeadByTag: (tag) => {
         if (tag) {
           const r = getAutoLeadRecordForTag(tag);
@@ -4079,6 +4290,13 @@
         scheduleSyncUI();
         if (activeTab === 'tags') renderLogs(true);
       }
+    };
+    WIN.__TT_CLICK_CTRL__ = {
+      getClickEnabled: () => CFG.clickEnabled !== false,
+      setClickEnabled: (en) => setClickEnabledState(Boolean(en), true),
+      isRgbBlinking: () => Boolean(rgbBlinkActive),
+      startRgbBlink: (el, x, y, reason, isTest) => startTargetRgbBlink(el, x, y, reason || 'API', Boolean(isTest)),
+      stopRgbBlink: (reason) => stopTargetRgbBlink(reason || 'API', true)
     };
   } catch {}
 
@@ -4428,6 +4646,7 @@
   }
 
   function markManualRoundEnd(reason) {
+    try { if (typeof stopTargetRgbBlink === 'function') stopTargetRgbBlink('MANUAL_ROUND_END', false); } catch {}
     const monoNow = performance.now();
     if (currentRoundStartMono > 0 && monoNow - currentRoundStartMono < 600) return false;
     if (monoNow - lastTagRoundEndMono < 600 && tagRoundCount > 0) return false;
@@ -5497,12 +5716,213 @@
   root.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483647;font-family:system-ui,-apple-system,sans-serif;';
   const hudShadow = (root && typeof root.attachShadow === 'function') ? root.attachShadow({ mode: 'closed' }) : null;
   const hudContainer = hudShadow || root;
+  let rgbHaloEl = null;
+  let rgbStyleEl = null;
+  let rgbBlinkActive = false;
+  let rgbBlinkEl = null;
+  let rgbBlinkStartedAt = 0;
+  let rgbBlinkSafetyTimer = 0;
+  let rgbBlinkFollowTimer = 0;
+  let rgbBlinkIsTest = false;
+  let rgbBlinkColorIdx = 0;
+  const RGB_BLINK_COLORS = ['#ff0040', '#ff9900', '#facc15', '#00ff66', '#00e5ff', '#7b2cff', '#ff00cc'];
+
   function isOwnHudNode(n) {
     if (!n) return false;
     if (n === root || root.contains(n)) return true;
+    if (rgbHaloEl && (n === rgbHaloEl || (rgbHaloEl.contains && rgbHaloEl.contains(n)))) return true;
+    if (rgbStyleEl && n === rgbStyleEl) return true;
+    try {
+      if (n.id === '__tt_rgb_led_halo' || n.id === '__tt_rgb_blink_style') return true;
+      if (n.getAttribute && n.getAttribute('data-tt-hud') === '1') return true;
+      if (n.closest && n.closest('[data-tt-hud="1"], #__tt_rgb_led_halo')) return true;
+    } catch {}
     if (hudShadow && typeof hudShadow.contains === 'function' && hudShadow.contains(n)) return true;
     try { if (hudShadow && typeof n.getRootNode === 'function' && n.getRootNode() === hudShadow) return true; } catch {}
     return false;
+  }
+
+  function ensureRgbBlinkStyleAndHalo() {
+    try {
+      const targetDoc = (rgbBlinkEl && rgbBlinkEl.ownerDocument) || document;
+      if (!rgbStyleEl || !rgbStyleEl.isConnected) {
+        const existingSt = targetDoc.getElementById('__tt_rgb_blink_style');
+        if (existingSt) {
+          rgbStyleEl = existingSt;
+        } else {
+          rgbStyleEl = targetDoc.createElement('style');
+          rgbStyleEl.id = '__tt_rgb_blink_style';
+          rgbStyleEl.setAttribute('data-tt-hud', '1');
+          rgbStyleEl.textContent = [
+            '@keyframes ttUserRgbBlink {',
+            '  0%   { box-shadow: 0 0 18px 4px #ff0040, 0 0 42px 8px rgba(255,0,64,0.88), inset 0 0 16px rgba(255,0,64,0.68); outline: 3px solid #ff0040; outline-offset: 2px; }',
+            '  16%  { box-shadow: 0 0 20px 5px #ff9900, 0 0 46px 9px rgba(255,153,0,0.92), inset 0 0 18px rgba(255,153,0,0.72); outline: 3px solid #ff9900; outline-offset: 2px; }',
+            '  33%  { box-shadow: 0 0 22px 5px #facc15, 0 0 48px 10px rgba(250,204,21,0.94), inset 0 0 18px rgba(250,204,21,0.75); outline: 3px solid #facc15; outline-offset: 2px; }',
+            '  50%  { box-shadow: 0 0 22px 5px #00ff66, 0 0 48px 10px rgba(0,255,102,0.95), inset 0 0 18px rgba(0,255,102,0.76); outline: 3px solid #00ff66; outline-offset: 2px; }',
+            '  66%  { box-shadow: 0 0 22px 5px #00e5ff, 0 0 48px 10px rgba(0,229,255,0.95), inset 0 0 18px rgba(0,229,255,0.75); outline: 3px solid #00e5ff; outline-offset: 2px; }',
+            '  83%  { box-shadow: 0 0 20px 5px #a855f7, 0 0 46px 9px rgba(168,85,247,0.92), inset 0 0 18px rgba(255,0,204,0.72); outline: 3px solid #ff00cc; outline-offset: 2px; }',
+            '  100% { box-shadow: 0 0 18px 4px #ff0040, 0 0 42px 8px rgba(255,0,64,0.88), inset 0 0 16px rgba(255,0,64,0.68); outline: 3px solid #ff0040; outline-offset: 2px; }',
+            '}',
+            '.tt-rgb-led-target {',
+            '  filter: brightness(1.68) saturate(2.25) contrast(1.16) !important;',
+            '  animation: ttUserRgbBlink 0.28s linear infinite !important;',
+            '  transition: none !important;',
+            '}'
+          ].join('\n');
+          const hostHead = targetDoc.head || targetDoc.documentElement;
+          if (hostHead && typeof hostHead.appendChild === 'function') hostHead.appendChild(rgbStyleEl);
+        }
+      }
+      if (!rgbHaloEl || !rgbHaloEl.isConnected) {
+        const existingHalo = targetDoc.getElementById('__tt_rgb_led_halo');
+        if (existingHalo) {
+          rgbHaloEl = existingHalo;
+        } else {
+          rgbHaloEl = targetDoc.createElement('div');
+          rgbHaloEl.id = '__tt_rgb_led_halo';
+          rgbHaloEl.setAttribute('data-tt-hud', '1');
+          rgbHaloEl.style.cssText = 'position:fixed;display:none;pointer-events:none;z-index:2147483645;border-radius:10px;border:3px solid #ff0040;box-sizing:border-box;mix-blend-mode:screen;filter:brightness(1.7) saturate(2.3);animation:ttUserRgbBlink 0.28s linear infinite;';
+          const hostBody = targetDoc.body || targetDoc.documentElement;
+          if (hostBody && typeof hostBody.appendChild === 'function') hostBody.appendChild(rgbHaloEl);
+        }
+      }
+    } catch {}
+  }
+
+  function updateRgbHaloPosition(fallbackX, fallbackY) {
+    if (!rgbHaloEl) return;
+    try {
+      if (rgbBlinkEl && rgbBlinkEl.isConnected && typeof rgbBlinkEl.getBoundingClientRect === 'function') {
+        const r = rgbBlinkEl.getBoundingClientRect();
+        if (r && r.width > 4 && r.height > 4) {
+          rgbHaloEl.style.left = Math.round(r.left - 3) + 'px';
+          rgbHaloEl.style.top = Math.round(r.top - 3) + 'px';
+          rgbHaloEl.style.width = Math.round(r.width + 6) + 'px';
+          rgbHaloEl.style.height = Math.round(r.height + 6) + 'px';
+          rgbHaloEl.style.borderRadius = '10px';
+          rgbHaloEl.style.display = 'block';
+          return;
+        }
+      }
+      if (typeof fallbackX === 'number' && typeof fallbackY === 'number' && fallbackX > 0 && fallbackY > 0) {
+        rgbHaloEl.style.left = Math.round(fallbackX - 28) + 'px';
+        rgbHaloEl.style.top = Math.round(fallbackY - 22) + 'px';
+        rgbHaloEl.style.width = '56px';
+        rgbHaloEl.style.height = '44px';
+        rgbHaloEl.style.borderRadius = '12px';
+        rgbHaloEl.style.display = 'block';
+      }
+    } catch {}
+  }
+
+  function startTargetRgbBlink(el, x, y, reason, isTest, fromSync) {
+    try {
+      stopTargetRgbBlink('RESTART', true);
+      rgbBlinkActive = true;
+      rgbBlinkStartedAt = performance.now();
+      rgbBlinkIsTest = Boolean(isTest || reason === 'TEST');
+      let targetEl = (el && el.nodeType === 1 && !isOwnHudNode(el)) ? el : null;
+      if (!targetEl && typeof x === 'number' && typeof y === 'number') {
+        targetEl = (typeof deepElementFromPoint === 'function' ? deepElementFromPoint(document, x, y, false) : null)
+          || (typeof findFallbackBtnOuter === 'function' ? findFallbackBtnOuter(document, x, y) : null);
+      }
+      if (!targetEl && anchor && anchor.el && anchor.el.isConnected && !isOwnHudNode(anchor.el)) {
+        targetEl = anchor.el;
+      }
+      rgbBlinkEl = targetEl;
+      ensureRgbBlinkStyleAndHalo();
+      if (rgbBlinkEl && rgbBlinkEl.classList) {
+        try { rgbBlinkEl.classList.add('tt-rgb-led-target'); } catch {}
+      }
+      if (crosshair) {
+        try { crosshair.style.boxShadow = '0 0 18px 3px #00ff66, 0 0 32px rgba(0,229,255,0.85)'; } catch {}
+      }
+      updateRgbHaloPosition(x, y);
+      if (rgbBlinkFollowTimer) clearInterval(rgbBlinkFollowTimer);
+      rgbBlinkFollowTimer = setInterval(() => {
+        if (!rgbBlinkActive) return;
+        rgbBlinkColorIdx = (rgbBlinkColorIdx + 1) % RGB_BLINK_COLORS.length;
+        if (rgbHaloEl) {
+          const c = RGB_BLINK_COLORS[rgbBlinkColorIdx];
+          rgbHaloEl.style.borderColor = c;
+          rgbHaloEl.style.boxShadow = '0 0 22px 5px ' + c + ', 0 0 46px 10px ' + c;
+        }
+        updateRgbHaloPosition(x, y);
+      }, 65);
+      if (rgbBlinkSafetyTimer) clearTimeout(rgbBlinkSafetyTimer);
+      rgbBlinkSafetyTimer = setTimeout(() => {
+        stopTargetRgbBlink('SAFETY_TIMEOUT', false);
+      }, rgbBlinkIsTest ? 4500 : 28000);
+      if (!fromSync) {
+        try {
+          if (isIframe) sendToTop({ __TT_SNIFFER__: true, kind: 'RGB_BLINK_START', reason: String(reason || 'CLICK'), x: x, y: y, isTest: rgbBlinkIsTest });
+          else broadcastDownToIframes({ __TT_SNIFFER__: true, kind: 'RGB_BLINK_START', reason: String(reason || 'CLICK'), x: x, y: y, isTest: rgbBlinkIsTest });
+        } catch {}
+      }
+      if (!fromSync && typeof queueRelay === 'function') {
+        try {
+          queueRelay({
+            uid: FRAME_ID + ':rgb:' + (++evSeq),
+            src: 'VM-BRIDGE',
+            kind: 'RGB',
+            matched: false,
+            matchedTag: 'RGB_LED_START',
+            time: fmtTimeMs(new Date()),
+            monoMs: Number(rgbBlinkStartedAt.toFixed(2)),
+            text: JSON.stringify({ event: 'RGB_BLINK_START', reason: String(reason || 'CLICK'), clickEnabled: CFG.clickEnabled !== false })
+          });
+        } catch {}
+      }
+    } catch {}
+  }
+
+  function stopTargetRgbBlink(reason, suppressSync) {
+    const wasActive = rgbBlinkActive;
+    try {
+      rgbBlinkActive = false;
+      rgbBlinkIsTest = false;
+      if (rgbBlinkSafetyTimer) { clearTimeout(rgbBlinkSafetyTimer); rgbBlinkSafetyTimer = 0; }
+      if (rgbBlinkFollowTimer) { clearInterval(rgbBlinkFollowTimer); rgbBlinkFollowTimer = 0; }
+      if (rgbBlinkEl && rgbBlinkEl.classList) {
+        try { rgbBlinkEl.classList.remove('tt-rgb-led-target'); } catch {}
+      }
+      rgbBlinkEl = null;
+      if (rgbHaloEl) rgbHaloEl.style.display = 'none';
+      if (crosshair) {
+        try { crosshair.style.boxShadow = '0 0 0 2px rgba(0,0,0,0.55),0 6px 20px rgba(0,0,0,0.45)'; } catch {}
+      }
+      if (wasActive && !suppressSync) {
+        try {
+          if (isIframe) sendToTop({ __TT_SNIFFER__: true, kind: 'RGB_BLINK_STOP', reason: String(reason || 'STOP') });
+          else broadcastDownToIframes({ __TT_SNIFFER__: true, kind: 'RGB_BLINK_STOP', reason: String(reason || 'STOP') });
+        } catch {}
+        if (typeof queueRelay === 'function') {
+          try {
+            queueRelay({
+              uid: FRAME_ID + ':rgb:' + (++evSeq),
+              src: 'VM-BRIDGE',
+              kind: 'RGB',
+              matched: false,
+              matchedTag: 'RGB_LED_STOP',
+              time: fmtTimeMs(new Date()),
+              monoMs: Number(performance.now().toFixed(2)),
+              text: JSON.stringify({ event: 'RGB_BLINK_STOP', reason: String(reason || 'STOP') })
+            });
+          } catch {}
+        }
+      }
+    } catch {}
+    return wasActive;
+  }
+
+  function setClickEnabledState(enabled, broadcast) {
+    CFG.clickEnabled = Boolean(enabled);
+    lastUserCfgEditAt = Date.now();
+    persistHudControlState();
+    if (typeof markUserTouched === 'function') markUserTouched();
+    if (typeof syncUI === 'function' && !hudHidden) syncUI();
+    if (typeof syncTurboCfg === 'function') syncTurboCfg(true, Boolean(broadcast));
+    return CFG.clickEnabled;
   }
   function getHudActiveElement() {
     try {
@@ -5644,6 +6064,26 @@
   elTopAuto3xChip.id = '__tt_top_auto3x_chip';
   elTopAuto3xChip.type = 'button';
   elTopAuto3xChip.title = CFG.lang === 'bn' ? '৪-৫ রাউন্ড চেক করে ট্যাগ অনুযায়ী অটো 3x ms সেট (চালু/বন্ধ)' : 'Check 4-5 rounds per tag and auto-set 3x Lead ms';
+  const elLeadModeSel = mkEl('select', 'background:#0f172a;color:#fde68a;border:1px solid rgba(251,191,36,0.45);border-radius:6px;padding:2px 4px;font-family:monospace;font-size:9.5px;font-weight:700;cursor:pointer;touch-action:manipulation;outline:none;', '');
+  elLeadModeSel.id = '__tt_lead_mode_sel';
+  elLeadModeSel.title = CFG.lang === 'bn' ? 'অটো অথবা ম্যানুয়াল 1x–12x / Custom ms নির্বাচন করুন' : 'Choose Auto or Manual 1x–12x multiplier or Custom ms';
+  [
+    ['auto', '⚡ Auto'],
+    ['1', '1x'],
+    ['2', '2x'],
+    ['3', '3x'],
+    ['5', '5x'],
+    ['6', '6x'],
+    ['8', '8x'],
+    ['10', '10x'],
+    ['12', '12x'],
+    ['manual_ms', '✎ ms']
+  ].forEach(([val, lbl]) => {
+    const opt = document.createElement('option');
+    opt.value = val;
+    opt.textContent = lbl;
+    elLeadModeSel.appendChild(opt);
+  });
   const elTopOpenTagsBtn = mkEl('button', 'background:#1e293b;color:#7dd3fc;border:1px solid rgba(56,189,248,0.4);border-radius:6px;padding:3px 6px;font-size:10px;font-weight:700;cursor:pointer;touch-action:manipulation;white-space:nowrap;', '🏷 Engine');
   elTopOpenTagsBtn.id = '__tt_top_open_tags';
   elTopOpenTagsBtn.type = 'button';
@@ -5654,6 +6094,7 @@
   elPreTrigCtrlRow.appendChild(elTopHistChip);
   elPreTrigCtrlRow.appendChild(elPreTrigRight);
   elPreTrigCtrlRow.appendChild(elTopAuto3xChip);
+  elPreTrigCtrlRow.appendChild(elLeadModeSel);
   elPreTrigCtrlRow.appendChild(elTopOpenTagsBtn);
   const elPreTrigInfoRow = mkEl('div', 'display:flex;align-items:center;justify-content:space-between;gap:5px;min-width:0;');
   const elPreTrigInfo = mkEl('div', 'min-width:0;flex:1;font-family:monospace;font-size:9.5px;font-weight:600;color:#6ee7b7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;', 'Pre-Trig: READY (-100ms)');
@@ -5815,7 +6256,12 @@
   const elTest = mkEl('button', 'background:#1e293b;color:#e2e8f0;border:1px solid rgba(255,255,255,0.14);border-radius:8px;padding:8px 8px;font-size:11px;cursor:pointer;touch-action:manipulation;white-space:nowrap;', T.test);
   elTest.id = '__tt_test';
   elTest.type = 'button';
+  const elClickSwitch = mkEl('button', 'background:#065f46;color:#ecfdf5;border:1px solid rgba(16,185,129,0.55);border-radius:8px;padding:8px 8px;font-weight:700;font-size:10.5px;cursor:pointer;touch-action:manipulation;white-space:nowrap;', '🖱 Click: ON');
+  elClickSwitch.id = '__tt_click_switch';
+  elClickSwitch.type = 'button';
+  elClickSwitch.title = CFG.lang === 'bn' ? 'OFF রাখলে আসল ক্লিক হবে না, শুধু RGB লাইট ব্লিংক করবে' : 'When OFF, suppresses clicks while keeping RGB LED blink active until cashout';
   rowAct.appendChild(elArm);
+  rowAct.appendChild(elClickSwitch);
   rowAct.appendChild(elLock);
   rowAct.appendChild(elPickEl);
   rowAct.appendChild(elCenter);
@@ -6524,16 +6970,44 @@
       elTopHistChip.style.color = histSwitchOn ? '#ecfeff' : '#94a3b8';
       elTopHistChip.style.borderColor = histSwitchOn ? 'rgba(34,211,238,0.45)' : 'rgba(255,255,255,0.16)';
     }
+    if (elClickSwitch) {
+      const clkOn = CFG.clickEnabled !== false;
+      elClickSwitch.textContent = clkOn
+        ? '🖱 Click: ON'
+        : (CFG.lang === 'bn' ? '🚫 ক্লিক OFF (RGB)' : '🚫 Click: OFF (RGB)');
+      elClickSwitch.style.background = clkOn ? '#065f46' : '#881337';
+      elClickSwitch.style.color = clkOn ? '#ecfdf5' : '#ffe4e6';
+      elClickSwitch.style.borderColor = clkOn ? 'rgba(16,185,129,0.55)' : 'rgba(251,113,133,0.75)';
+    }
+    const curGlobalLeadMode = normalizeLeadMode(CFG.globalLeadMode);
+    const curGlobalLeadMult = normalizeMultPreset(CFG.globalLeadMultiplier);
+    if (elLeadModeSel && actHudEl !== elLeadModeSel) {
+      elLeadModeSel.value = curGlobalLeadMode === 'manual_mult' ? String(curGlobalLeadMult) : curGlobalLeadMode;
+    }
     if (elTopAuto3xChip) {
-      elTopAuto3xChip.textContent = auto3xOn ? '⚡ 3x Auto: ON' : '⚡ 3x Auto: OFF';
-      elTopAuto3xChip.style.background = auto3xOn ? '#065f46' : '#0f172a';
-      elTopAuto3xChip.style.color = auto3xOn ? '#d1fae5' : '#94a3b8';
-      elTopAuto3xChip.style.borderColor = auto3xOn ? 'rgba(16,185,129,0.55)' : 'rgba(255,255,255,0.16)';
+      if (curGlobalLeadMode === 'manual_mult') {
+        elTopAuto3xChip.textContent = '🔒 ' + curGlobalLeadMult + 'x';
+        elTopAuto3xChip.style.background = '#78350f';
+        elTopAuto3xChip.style.color = '#fef3c7';
+        elTopAuto3xChip.style.borderColor = 'rgba(251,191,36,0.55)';
+      } else if (curGlobalLeadMode === 'manual_ms') {
+        elTopAuto3xChip.textContent = '✎ Manual ms';
+        elTopAuto3xChip.style.background = '#0f172a';
+        elTopAuto3xChip.style.color = '#94a3b8';
+        elTopAuto3xChip.style.borderColor = 'rgba(255,255,255,0.16)';
+      } else {
+        elTopAuto3xChip.textContent = auto3xOn ? '⚡ 3x Auto: ON' : '⚡ 3x Auto: OFF';
+        elTopAuto3xChip.style.background = auto3xOn ? '#065f46' : '#0f172a';
+        elTopAuto3xChip.style.color = auto3xOn ? '#d1fae5' : '#94a3b8';
+        elTopAuto3xChip.style.borderColor = auto3xOn ? 'rgba(16,185,129,0.55)' : 'rgba(255,255,255,0.16)';
+      }
     }
     if (elAuto3xDrawerBtn) {
-      elAuto3xDrawerBtn.textContent = auto3xOn ? '⚡ Auto 3x+ (Server Auto): ON' : '⚡ Auto 3x+ (Server Auto): OFF';
-      elAuto3xDrawerBtn.style.background = auto3xOn ? '#065f46' : '#0f172a';
-      elAuto3xDrawerBtn.style.color = auto3xOn ? '#d1fae5' : '#94a3b8';
+      elAuto3xDrawerBtn.textContent = curGlobalLeadMode === 'manual_mult'
+        ? ('🔒 Manual ' + curGlobalLeadMult + 'x Active')
+        : (auto3xOn ? '⚡ Auto 3x+ (Server Auto): ON' : '⚡ Auto 3x+ (Server Auto): OFF');
+      elAuto3xDrawerBtn.style.background = curGlobalLeadMode === 'manual_mult' ? '#78350f' : (auto3xOn ? '#065f46' : '#0f172a');
+      elAuto3xDrawerBtn.style.color = curGlobalLeadMode === 'manual_mult' ? '#fef3c7' : (auto3xOn ? '#d1fae5' : '#94a3b8');
     }
     if (elHistPredBtn) {
       elHistPredBtn.textContent = histSwitchOn ? T.histPredEngineOn : T.histPredEngineOff;
@@ -6725,6 +7199,10 @@
     const sigParts = [
       CFG.lang || 'bn',
       CFG.armed ? '1' : '0',
+      CFG.clickEnabled !== false ? '1' : '0',
+      normalizeLeadMode(CFG.globalLeadMode),
+      String(normalizeMultPreset(CFG.globalLeadMultiplier)),
+      String(Math.round(Number(CFG.predictivePreTriggerLeadMs) || 0)),
       CFG.autoLead3xEnabled !== false ? '1' : '0'
     ];
 
@@ -6747,10 +7225,12 @@
       );
       if (isBad) anyWarning = true;
       const autoRec = getAutoLeadRecordForTag(t);
+      const tOv = getTagLeadOverride(t);
+      const ovSig = tOv ? (tOv.mode + ':' + (tOv.multiplier || '') + ':' + (tOv.manualMs || '')) : 'global';
       const aSig = autoRec
         ? (autoRec.roundCount + ':' + (autoRec.calibrated ? 1 : 0) + ':' + (autoRec.appliedLeadMs || 0) + ':' + (autoRec.verifyStatus || '') + ':' + (autoRec.verifyReason || ''))
         : '';
-      sigParts.push(t + '|' + (isHot ? 1 : 0) + '|' + (st ? st.count : 0) + '|' + (isBad ? 1 : 0) + '|' + aSig);
+      sigParts.push(t + '|' + (isHot ? 1 : 0) + '|' + (st ? st.count : 0) + '|' + (isBad ? 1 : 0) + '|' + ovSig + '|' + aSig);
     }
 
     if (!configured.length) {
@@ -6821,6 +7301,8 @@
         (ent && (ent.isCrashTag || ent.isNonCashoutPhase))
       );
       const autoRec = getAutoLeadRecordForTag(t);
+      const tOv = getTagLeadOverride(t);
+      const effLeadNow = getEffectiveLeadMsForTag(t);
 
       const chip = document.createElement('div');
       chip.dataset.tagLedItem = t;
@@ -6878,6 +7360,42 @@
           autoPill.textContent = '⏳' + autoRec.roundCount + '/' + AUTO_LEAD_MIN_ROUNDS + 'R';
           chip.appendChild(autoPill);
         }
+      }
+
+      const tSel = document.createElement('select');
+      tSel.style.cssText = 'background:#0b1120;color:#fde68a;border:1px solid rgba(251,191,36,0.35);border-radius:4px;padding:1px 3px;font-family:monospace;font-size:9px;font-weight:700;cursor:pointer;touch-action:manipulation;';
+      [['global', 'Global'], ['auto', 'Auto'], ['1', '1x'], ['2', '2x'], ['3', '3x'], ['5', '5x'], ['6', '6x'], ['8', '8x'], ['10', '10x'], ['12', '12x'], ['manual_ms', 'ms']].forEach(([v, l]) => {
+        const o = document.createElement('option');
+        o.value = v;
+        o.textContent = l;
+        tSel.appendChild(o);
+      });
+      tSel.value = !tOv ? 'global' : (tOv.mode === 'manual_mult' ? String(normalizeMultPreset(tOv.multiplier)) : tOv.mode);
+      stopInputBubble(tSel);
+      tSel.onchange = (e) => {
+        e.stopPropagation();
+        const v = tSel.value;
+        if (v === 'global') setTagLeadOverride(t, 'global');
+        else if (v === 'auto') setTagLeadOverride(t, 'auto');
+        else if (v === 'manual_ms') setTagLeadOverride(t, 'manual_ms', effLeadNow);
+        else setTagLeadOverride(t, 'manual_mult', Number(v));
+      };
+      chip.appendChild(tSel);
+
+      if (tOv && tOv.mode === 'manual_ms') {
+        const tMsInp = document.createElement('input');
+        tMsInp.type = 'number';
+        tMsInp.min = '0';
+        tMsInp.max = String(MAX_PRETRIG_LEAD_MS);
+        tMsInp.step = '5';
+        tMsInp.value = String(typeof tOv.manualMs === 'number' ? tOv.manualMs : effLeadNow);
+        tMsInp.style.cssText = 'width:46px;background:#0b1120;color:#fde68a;border:1px solid rgba(251,191,36,0.45);border-radius:4px;padding:1px 3px;font-family:monospace;font-size:9px;font-weight:700;text-align:center;';
+        stopInputBubble(tMsInp);
+        tMsInp.onchange = (e) => {
+          e.stopPropagation();
+          setTagLeadOverride(t, 'manual_ms', Number(tMsInp.value));
+        };
+        chip.appendChild(tMsInp);
       }
 
       const rmBtn = document.createElement('button');
@@ -7271,6 +7789,10 @@
         cooldownMs: Number(CFG.cooldownMs) || 0,
         oneShot: Boolean(CFG.oneShot),
         roundOnce: Boolean(CFG.roundOnce),
+        clickEnabled: Boolean(CFG.clickEnabled !== false),
+        globalLeadMode: normalizeLeadMode(CFG.globalLeadMode),
+        globalLeadMultiplier: normalizeMultPreset(CFG.globalLeadMultiplier),
+        tagLeadOverrides: Object.assign({}, CFG.tagLeadOverrides || {}),
         zeroDelay: Boolean(CFG.zeroDelay),
         zeroDelayMicroMs: Math.max(0, Math.min(5, Math.round((Number(CFG.zeroDelayMicroMs) || 0) * 2) / 2)),
         holdMs: CFG.zeroDelay
@@ -7396,6 +7918,10 @@
       predictivePreTriggerLeadMs: Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Math.round(Number(CFG.predictivePreTriggerLeadMs != null ? CFG.predictivePreTriggerLeadMs : 100)))),
       predictiveLeadTimeMs: Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Math.round(Number(CFG.predictivePreTriggerLeadMs != null ? CFG.predictivePreTriggerLeadMs : 100)))),
       autoLead3xEnabled: Boolean(CFG.autoLead3xEnabled !== false),
+      clickEnabled: Boolean(CFG.clickEnabled !== false),
+      globalLeadMode: normalizeLeadMode(CFG.globalLeadMode),
+      globalLeadMultiplier: normalizeMultPreset(CFG.globalLeadMultiplier),
+      tagLeadOverrides: Object.assign({}, CFG.tagLeadOverrides || {}),
       histTagPredMinSamples: Math.max(1, Math.min(20, Math.round(Number(CFG.histTagPredMinSamples) || 2))),
       histTagPredMinConfidence: Math.max(10, Math.min(100, Math.round(Number(CFG.histTagPredMinConfidence) || 60))),
       listenDOC: Boolean(CFG.listenDOC !== false)
@@ -7494,6 +8020,7 @@
   stopInputBubble(elInspHoldInp);
   stopInputBubble(elPreTrigLeadInp);
   stopInputBubble(elPreTrigQuickLead);
+  stopInputBubble(elLeadModeSel);
   stopInputBubble(elHistMinSamInp);
   stopInputBubble(elHistMinConfInp);
   stopInputBubble(elInspKw);
@@ -7780,16 +8307,12 @@
     if (activeTab === 'tags') renderLogs(true);
   };
   const toggleAutoLead3xSystem = () => {
-    CFG.autoLead3xEnabled = !(CFG.autoLead3xEnabled !== false);
-    lastUserCfgEditAt = Date.now();
-    persistHudControlState();
-    markUserTouched();
-    syncUI();
-    syncTurboCfg(true, true);
-    if (CFG.armed && CFG.predictivePreTriggerEnabled !== false && CFG.histTagPredEnabled !== false && !hudHidden && (currentRoundStartMono > lastTagRoundEndMono || currentFlightStartMono > lastTagRoundEndMono)) {
-      if (maybeSchedulePredictivePreTrigger(performance.now())) syncUI();
+    const nextOn = !(CFG.autoLead3xEnabled !== false);
+    if (nextOn) {
+      setGlobalLeadConfig('auto');
+    } else {
+      setGlobalLeadConfig('manual_ms', CFG.predictivePreTriggerLeadMs);
     }
-    if (activeTab === 'tags') renderLogs(true);
   };
   stopInputBubble(elHdrHistBtn);
   stopInputBubble(elTopPreTrigChip);
@@ -7797,6 +8320,7 @@
   stopInputBubble(elTopAuto3xChip);
   stopInputBubble(elTopOpenTagsBtn);
   stopInputBubble(elTopApplyCandBtn);
+  stopInputBubble(elClickSwitch);
   bindTap(elHdrHistBtn, openHistEngineTab);
   bindTap(elTopOpenTagsBtn, openHistEngineTab);
   bindTap(elPreTrigBtn, togglePreTriggerSystem);
@@ -7805,6 +8329,16 @@
   bindTap(elTopHistChip, toggleHistPredEngine);
   bindTap(elTopAuto3xChip, toggleAutoLead3xSystem);
   bindTap(elAuto3xDrawerBtn, toggleAutoLead3xSystem);
+  bindTap(elClickSwitch, () => setClickEnabledState(!(CFG.clickEnabled !== false), true));
+  if (elLeadModeSel) {
+    elLeadModeSel.addEventListener('change', (e) => {
+      e.stopPropagation();
+      const val = String(elLeadModeSel.value || 'auto');
+      if (val === 'auto') setGlobalLeadConfig('auto');
+      else if (val === 'manual_ms') setGlobalLeadConfig('manual_ms', CFG.predictivePreTriggerLeadMs);
+      else setGlobalLeadConfig('manual_mult', Number(val));
+    });
+  }
   bindTap(elPreTrigInfo, () => { showGateTuner = !showGateTuner; markUserTouched(); syncUI(); });
   bindTap(elHistPredBtn, toggleHistPredEngine);
   bindTap(elTopApplyCandBtn, () => {
@@ -7815,13 +8349,18 @@
   const onPreTrigLeadChange = (rawVal) => {
     if (preTrigLeadTimer) { clearTimeout(preTrigLeadTimer); preTrigLeadTimer = 0; }
     const safeLead = Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Math.round(Number(rawVal) || 0)));
+    CFG.globalLeadMode = 'manual_ms';
+    CFG.autoLead3xEnabled = false;
     CFG.predictivePreTriggerLeadMs = safeLead;
     CFG.predictiveLeadTimeMs = safeLead;
     const activeRules = parseTagList((elTags && elTags.value) || CFG.tags || '');
     if (activeRules.length === 1) {
+      if (!CFG.tagLeadOverrides || typeof CFG.tagLeadOverrides !== 'object') CFG.tagLeadOverrides = {};
+      CFG.tagLeadOverrides[activeRules[0]] = { mode: 'manual_ms', manualMs: safeLead };
       const rec = getAutoLeadRecordForTag(activeRules[0]);
       if (rec) {
         rec.appliedLeadMs = safeLead;
+        rec.recommendedLeadMs = safeLead;
         rec.updatedAt = Date.now();
         saveTagAutoLeadData(false);
       }
@@ -7959,6 +8498,7 @@
   bindTap(elArm, () => {
     CFG.tags = elTags.value;
     CFG.armed = !CFG.armed;
+    if (!CFG.armed && typeof stopTargetRgbBlink === 'function') stopTargetRgbBlink('ARM_TOGGLE', true);
     if (lastHitTag === 'TEST') lastHitTag = '';
     cancelPredictivePreTrigger('ARM_TOGGLE');
     preTriggerFiredThisRound = false;
@@ -9013,6 +9553,31 @@
       syncTurboCfg(true, true);
       renderLogs(true);
     }));
+    const histModeWrap = document.createElement('label');
+    histModeWrap.style.cssText = 'display:inline-flex;align-items:center;gap:3px;font-family:monospace;';
+    const histModeLbl = document.createElement('span');
+    histModeLbl.textContent = 'Mode:';
+    const histModeSel = document.createElement('select');
+    histModeSel.style.cssText = 'background:#0b1120;color:#fde68a;border:1px solid rgba(251,191,36,0.35);border-radius:4px;padding:1px 3px;font-family:monospace;font-size:9.5px;font-weight:700;';
+    [['auto', 'Auto'], ['1', '1x'], ['2', '2x'], ['3', '3x'], ['5', '5x'], ['6', '6x'], ['8', '8x'], ['10', '10x'], ['12', '12x'], ['manual_ms', 'ms']].forEach(([v, l]) => {
+      const o = document.createElement('option');
+      o.value = v;
+      o.textContent = l;
+      histModeSel.appendChild(o);
+    });
+    const hmNow = normalizeLeadMode(CFG.globalLeadMode);
+    histModeSel.value = hmNow === 'manual_mult' ? String(normalizeMultPreset(CFG.globalLeadMultiplier)) : hmNow;
+    stopInputBubble(histModeSel);
+    histModeSel.onchange = (e) => {
+      e.stopPropagation();
+      const v = histModeSel.value;
+      if (v === 'auto') setGlobalLeadConfig('auto');
+      else if (v === 'manual_ms') setGlobalLeadConfig('manual_ms', CFG.predictivePreTriggerLeadMs);
+      else setGlobalLeadConfig('manual_mult', Number(v));
+    };
+    histModeWrap.appendChild(histModeLbl);
+    histModeWrap.appendChild(histModeSel);
+    histCtrlRow.appendChild(histModeWrap);
     histCard.appendChild(histCtrlRow);
 
     if (histPredList.length) {
@@ -9021,6 +9586,7 @@
         const hp = topHist[hi];
         const tagEffLead = getEffectiveLeadMsForTag(hp.tag);
         const tagAutoRec = getAutoLeadRecordForTag(hp.tag);
+        const tagOv = getTagLeadOverride(hp.tag);
         const fireAt = Math.max(25, Math.round(hp.predOffsetMs - tagEffLead));
         const verifyTagTxt = (tagAutoRec && tagAutoRec.calibrated && tagAutoRec.appliedLeadMs > 0 && tagAutoRec.verifyStatus)
           ? (tagAutoRec.verifyStatus === 'DONE'
@@ -9042,13 +9608,47 @@
         const hMetaEl = document.createElement('div');
         const hMetaCol = (tagAutoRec && tagAutoRec.verifyStatus === 'FAIL') ? '#fda4af' : (tagAutoRec && tagAutoRec.verifyStatus === 'DONE') ? '#6ee7b7' : '#94a3b8';
         hMetaEl.style.cssText = 'font-family:monospace;font-size:9px;color:' + hMetaCol + ';';
-        hMetaEl.textContent = hp.confidence + '% · ' + hp.samples + 'R (' + hp.anchorType + ') · ~' + hp.predOffsetMs + 'ms ±' + hp.jitterMs + 'ms · fire@' + fireAt + 'ms' + autoTagTxt;
+        hMetaEl.textContent = hp.confidence + '% · ' + hp.samples + 'R (' + hp.anchorType + ') · ~' + hp.predOffsetMs + 'ms ±' + hp.jitterMs + 'ms · fire@' + fireAt + 'ms (-' + tagEffLead + 'ms)' + autoTagTxt;
         if (tagAutoRec && tagAutoRec.verifyReason) hMetaEl.title = tagAutoRec.verifyReason;
         hLeft.appendChild(hTagEl);
         hLeft.appendChild(hMetaEl);
 
         const hBtns = document.createElement('div');
-        hBtns.style.cssText = 'display:flex;align-items:center;gap:3px;flex-shrink:0;';
+        hBtns.style.cssText = 'display:flex;align-items:center;gap:3px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end;';
+        const hModeSel = document.createElement('select');
+        hModeSel.style.cssText = 'background:#0b1120;color:#fde68a;border:1px solid rgba(251,191,36,0.35);border-radius:4px;padding:1px 2px;font-family:monospace;font-size:9px;font-weight:700;';
+        [['global', 'Global'], ['auto', 'Auto'], ['1', '1x'], ['2', '2x'], ['3', '3x'], ['5', '5x'], ['6', '6x'], ['8', '8x'], ['10', '10x'], ['12', '12x'], ['manual_ms', 'ms']].forEach(([v, l]) => {
+          const o = document.createElement('option');
+          o.value = v;
+          o.textContent = l;
+          hModeSel.appendChild(o);
+        });
+        hModeSel.value = !tagOv ? 'global' : (tagOv.mode === 'manual_mult' ? String(normalizeMultPreset(tagOv.multiplier)) : tagOv.mode);
+        stopInputBubble(hModeSel);
+        hModeSel.onchange = (e) => {
+          e.stopPropagation();
+          const v = hModeSel.value;
+          if (v === 'global') setTagLeadOverride(hp.tag, 'global');
+          else if (v === 'auto') setTagLeadOverride(hp.tag, 'auto');
+          else if (v === 'manual_ms') setTagLeadOverride(hp.tag, 'manual_ms', tagEffLead);
+          else setTagLeadOverride(hp.tag, 'manual_mult', Number(v));
+        };
+        hBtns.appendChild(hModeSel);
+        if (tagOv && tagOv.mode === 'manual_ms') {
+          const hMsInp = document.createElement('input');
+          hMsInp.type = 'number';
+          hMsInp.min = '0';
+          hMsInp.max = String(MAX_PRETRIG_LEAD_MS);
+          hMsInp.step = '5';
+          hMsInp.value = String(typeof tagOv.manualMs === 'number' ? tagOv.manualMs : tagEffLead);
+          hMsInp.style.cssText = 'width:46px;background:#0b1120;color:#fde68a;border:1px solid rgba(251,191,36,0.45);border-radius:4px;padding:1px 3px;font-family:monospace;font-size:9px;font-weight:700;text-align:center;';
+          stopInputBubble(hMsInp);
+          hMsInp.onchange = (e) => {
+            e.stopPropagation();
+            setTagLeadOverride(hp.tag, 'manual_ms', Number(hMsInp.value));
+          };
+          hBtns.appendChild(hMsInp);
+        }
         const alreadyActive = activeConfiguredTags.has(hp.tag);
         const hUseBtn = mkMiniBtn(
           alreadyActive ? '✓ On' : T.useTag,
@@ -10975,8 +11575,18 @@
       fpSalt: fpProf ? fpProf.salt : '',
       fpPressure: fpProf ? fpProf.pressure : undefined,
       fpRadius: fpProf ? fpProf.radiusX : undefined,
-      humanSpanMs: humanSpanMs
+      humanSpanMs: humanSpanMs,
+      dryRun: CFG.clickEnabled === false
     };
+    if (typeof startTargetRgbBlink === 'function') {
+      startTargetRgbBlink(btn || hit, evX, evY, lastDomClickSource || 'CLICK', isManualTestClk);
+    }
+    if (CFG.clickEnabled === false) {
+      if (typeof onDone === 'function') {
+        try { onDone(true, performance.now()); } catch {}
+      }
+      return true;
+    }
     const pid = fpProf ? fpProf.pid : (nextTapId = (nextTapId % 9000) + 1);
     const sx = fpProf ? Number((evX + (win.screenX || 0)).toFixed(2)) : Math.round(x + (win.screenX || 0));
     const sy = fpProf ? Number((evY + (win.screenY || 0)).toFixed(2)) : Math.round(y + (win.screenY || 0));
@@ -11957,12 +12567,16 @@
     } else if (raceKind === 'CASH') {
       lastCashAckAt = Date.now();
       curAutoRoundTiming.cashMono = effMonoMs;
+      if (typeof stopTargetRgbBlink === 'function') stopTargetRgbBlink('CASH', false);
       try {
         dispatchPageStrEvent('__TT_PAGE_CASH_ACK__', '', false);
         if (isIframe) sendToTop({ __TT_SNIFFER__: true, kind: 'CASH_ACK_SYNC', ts: lastCashAckAt, srcFrame: FRAME_ID });
         else broadcastDownToIframes({ __TT_SNIFFER__: true, kind: 'CASH_ACK_SYNC', ts: lastCashAckAt, srcFrame: FRAME_ID });
       } catch {}
     } else if (raceKind === 'START') {
+      if (rgbBlinkActive && !rgbBlinkIsTest && performance.now() - rgbBlinkStartedAt >= 120 && typeof stopTargetRgbBlink === 'function') {
+        stopTargetRgbBlink('START', false);
+      }
       if (curAutoRoundTiming.crashMono > 0 || curAutoRoundTiming.clickMono > 0 || curAutoRoundTiming.tagArrivals.size > 0) {
         if (effMonoMs - (curAutoRoundTiming.crashMono || effMonoMs) >= 150 || curAutoRoundTiming.clickMono > 0) {
           resetAutoLeadRoundWindow('START_PKT');
@@ -11971,11 +12585,16 @@
     } else if (raceKind === 'CRASH') {
       lastRoundCrashAt = Date.now();
       curAutoRoundTiming.crashMono = effMonoMs;
+      if (typeof stopTargetRgbBlink === 'function') stopTargetRgbBlink('CRASH', false);
       try {
         dispatchPageStrEvent('__TT_PAGE_CRASH_SYNC__', '', false);
         if (isIframe) sendToTop({ __TT_SNIFFER__: true, kind: 'ROUND_CRASH_SYNC', ts: lastRoundCrashAt, srcFrame: FRAME_ID });
         else broadcastDownToIframes({ __TT_SNIFFER__: true, kind: 'ROUND_CRASH_SYNC', ts: lastRoundCrashAt, srcFrame: FRAME_ID });
       } catch {}
+    } else if (raceKind === 'ERR') {
+      if (rgbBlinkActive && !rgbBlinkIsTest && typeof stopTargetRgbBlink === 'function') {
+        stopTargetRgbBlink('ERR', false);
+      }
     }
 
     if (lastClickRace) {
@@ -12216,7 +12835,7 @@
   }
 
   function dispatchDirectProtocolCashout() {
-    if (CFG.directWsCashout === false) return;
+    if (CFG.clickEnabled === false || CFG.directWsCashout === false) return;
     try {
       const payload = JSON.stringify({
         roundId: latestRoundMeta.roundId || '',
@@ -12231,7 +12850,7 @@
   }
 
   function armCashoutWatchdog(outCashBefore, fx, fy, fallbackBtn, sourceLabel) {
-    if (sourceLabel === 'TEST') return;
+    if (CFG.clickEnabled === false || sourceLabel === 'TEST') return;
     const canRetryForThisClick = Boolean(
       !lastDomClickMeta ||
       (!isBetOrCancelStr(String(lastDomClickMeta.preText || '').toLowerCase()) && !lastDomClickMeta.disabled)
@@ -12660,7 +13279,7 @@
         if (matched !== null) recordUserRuleArrivalInRound(matched, src, turboInfo.t0 || tStart, rawText);
       } catch {}
       const outCashBeforeTurbo = lastOutCashSentAt;
-      const turboBadClick = Boolean(turboInfo.preDis || turboInfo.wrongBtn || isButtonAlreadyEnded(turboInfo.preText || '', Boolean(turboInfo.preDis)));
+      const turboBadClick = Boolean(CFG.clickEnabled !== false && !turboInfo.dryRun && (turboInfo.preDis || turboInfo.wrongBtn || isButtonAlreadyEnded(turboInfo.preText || '', Boolean(turboInfo.preDis))));
       if (!turboBadClick) {
         cancelPredictivePreTrigger('REAL_TURBO_HIT');
         lastTriggerAt = Date.now();
@@ -12793,7 +13412,7 @@
               persistHudControlState();
             }
             fireTargetClick(src + '[' + matched + ']', tStart);
-            const needWrongBtnRetry = Boolean(lastDomClickMeta && isButtonAlreadyEnded(lastDomClickMeta.preText, lastDomClickMeta.disabled, lastDomClickEl));
+            const needWrongBtnRetry = Boolean(CFG.clickEnabled !== false && !(lastDomClickMeta && lastDomClickMeta.dryRun) && lastDomClickMeta && isButtonAlreadyEnded(lastDomClickMeta.preText, lastDomClickMeta.disabled, lastDomClickEl));
             if (needWrongBtnRetry) {
               if (triggerCount > 0) triggerCount -= 1;
               roundClickLocked = false;
@@ -14646,6 +15265,17 @@
     if (typeof c.histTagPredEnabled === 'boolean') CFG.histTagPredEnabled = c.histTagPredEnabled;
     if (typeof c.predictivePreTriggerEnabled === 'boolean') CFG.predictivePreTriggerEnabled = c.predictivePreTriggerEnabled;
     if (typeof c.autoLead3xEnabled === 'boolean') CFG.autoLead3xEnabled = c.autoLead3xEnabled;
+    if (typeof c.clickEnabled === 'boolean') CFG.clickEnabled = c.clickEnabled;
+    if (c.globalLeadMode === 'auto' || c.globalLeadMode === 'manual_mult' || c.globalLeadMode === 'manual_ms') {
+      CFG.globalLeadMode = c.globalLeadMode;
+      CFG.autoLead3xEnabled = c.globalLeadMode !== 'manual_ms';
+    }
+    if (typeof c.globalLeadMultiplier === 'number' && !Number.isNaN(c.globalLeadMultiplier)) {
+      CFG.globalLeadMultiplier = normalizeMultPreset(c.globalLeadMultiplier);
+    }
+    if (c.tagLeadOverrides && typeof c.tagLeadOverrides === 'object' && !Array.isArray(c.tagLeadOverrides)) {
+      CFG.tagLeadOverrides = Object.assign({}, c.tagLeadOverrides);
+    }
     const incomingLead = typeof c.predictiveLeadTimeMs === 'number'
       ? c.predictiveLeadTimeMs
       : c.predictivePreTriggerLeadMs;
@@ -14859,15 +15489,22 @@
         broadcastDownToIframes(d);
       } else if (d.kind === 'CASH_ACK_SYNC') {
         lastCashAckAt = Math.max(lastCashAckAt, Number(d.ts) || Date.now());
+        if (typeof stopTargetRgbBlink === 'function') stopTargetRgbBlink('CASH_ACK_SYNC', true);
         try { dispatchPageStrEvent('__TT_PAGE_CASH_ACK__', '', false); } catch {}
         broadcastDownToIframes(d);
       } else if (d.kind === 'ROUND_CRASH_SYNC') {
         lastRoundCrashAt = Math.max(lastRoundCrashAt, Number(d.ts) || Date.now());
+        if (typeof stopTargetRgbBlink === 'function') stopTargetRgbBlink('ROUND_CRASH_SYNC', true);
         try { dispatchPageStrEvent('__TT_PAGE_CRASH_SYNC__', '', false); } catch {}
         broadcastDownToIframes(d);
+      } else if (d.kind === 'RGB_BLINK_START') {
+        if (typeof startTargetRgbBlink === 'function') startTargetRgbBlink(null, d.x, d.y, d.reason || 'IFR', Boolean(d.isTest), true);
+      } else if (d.kind === 'RGB_BLINK_STOP') {
+        if (typeof stopTargetRgbBlink === 'function') stopTargetRgbBlink(d.reason || 'IFR_STOP', true);
       } else if (d.kind === 'ROUND_UNLOCK') {
         preTriggerFiredThisRound = false;
         cancelPredictivePreTrigger('ROUND_UNLOCK');
+        if (typeof stopTargetRgbBlink === 'function') stopTargetRgbBlink('ROUND_UNLOCK', true);
         if (CFG.roundOnce && roundClickLocked && Date.now() - roundClickLockedAt >= 60) {
           roundClickLocked = false;
           roundSawFlightAfterLock = false;
@@ -15161,13 +15798,22 @@
         broadcastDownToIframes(d);
       } else if (d.kind === 'CASH_ACK_SYNC') {
         lastCashAckAt = Math.max(lastCashAckAt, Number(d.ts) || Date.now());
+        if (typeof stopTargetRgbBlink === 'function') stopTargetRgbBlink('CASH_ACK_SYNC', true);
         try { dispatchPageStrEvent('__TT_PAGE_CASH_ACK__', '', false); } catch {}
         broadcastDownToIframes(d);
       } else if (d.kind === 'ROUND_CRASH_SYNC') {
         lastRoundCrashAt = Math.max(lastRoundCrashAt, Number(d.ts) || Date.now());
+        if (typeof stopTargetRgbBlink === 'function') stopTargetRgbBlink('ROUND_CRASH_SYNC', true);
         try { dispatchPageStrEvent('__TT_PAGE_CRASH_SYNC__', '', false); } catch {}
         broadcastDownToIframes(d);
+      } else if (d.kind === 'RGB_BLINK_START') {
+        if (typeof startTargetRgbBlink === 'function') startTargetRgbBlink(null, d.x, d.y, d.reason || 'TOP', Boolean(d.isTest), true);
+        broadcastDownToIframes(d);
+      } else if (d.kind === 'RGB_BLINK_STOP') {
+        if (typeof stopTargetRgbBlink === 'function') stopTargetRgbBlink(d.reason || 'TOP_STOP', true);
+        broadcastDownToIframes(d);
       } else if (d.kind === 'DIRECT_CASHOUT' && d.payload) {
+        if (CFG.clickEnabled === false) return;
         broadcastDownToIframes(d);
         try { dispatchPageStrEvent('__TT_DIRECT_CASHOUT__', d.payload, false); } catch {}
       } else if (d.kind === 'BATCH' && Array.isArray(d.events)) {
@@ -15482,11 +16128,35 @@
           else broadcastDownToIframes({ __TT_SNIFFER__: true, kind: 'OUT_CASH_SYNC', ts: lastOutCashSentAt, srcFrame: FRAME_ID });
         } catch {}
       };
-      const onPageCashAckSig = () => { lastCashAckAt = Date.now(); };
+      const onPageCashAckSig = () => {
+        lastCashAckAt = Date.now();
+        if (typeof stopTargetRgbBlink === 'function') stopTargetRgbBlink('PAGE_CASH_ACK', false);
+      };
+      const onPageRgbStart = (ev) => {
+        try {
+          let d = ev && ev.detail;
+          if (typeof d === 'string') d = JSON.parse(d);
+          if (!d) return;
+          if (typeof startTargetRgbBlink === 'function') {
+            startTargetRgbBlink(null, d.x, d.y, d.reason || 'PAGE_CLICK', Boolean(d.isTest));
+          }
+        } catch {}
+      };
+      const onPageRgbStop = (ev) => {
+        try {
+          let d = ev && ev.detail;
+          if (typeof d === 'string') d = JSON.parse(d);
+          if (typeof stopTargetRgbBlink === 'function') stopTargetRgbBlink((d && d.reason) || 'PAGE_STOP', false);
+        } catch {}
+      };
       document.addEventListener('__TT_PAGE_OUT_CASH__', onPageOutCashSig);
       targetWin.addEventListener('__TT_PAGE_OUT_CASH__', onPageOutCashSig);
       document.addEventListener('__TT_PAGE_CASH_ACK__', onPageCashAckSig);
       targetWin.addEventListener('__TT_PAGE_CASH_ACK__', onPageCashAckSig);
+      document.addEventListener('__TT_PAGE_RGB_START__', onPageRgbStart);
+      targetWin.addEventListener('__TT_PAGE_RGB_START__', onPageRgbStart);
+      document.addEventListener('__TT_PAGE_RGB_STOP__', onPageRgbStop);
+      targetWin.addEventListener('__TT_PAGE_RGB_STOP__', onPageRgbStop);
       if (CFG.listenWS || CFG.networkTap) {
         document.addEventListener('__TT_PAGE_WS__', onPageWsEvent);
         targetWin.addEventListener('__TT_PAGE_WS__', onPageWsEvent);
@@ -15675,6 +16345,9 @@
           cooldownMs: Number(CFG.cooldownMs) || 0,
           oneShot: Boolean(CFG.oneShot),
           roundOnce: Boolean(CFG.roundOnce),
+          clickEnabled: Boolean(CFG.clickEnabled !== false),
+          globalLeadMode: normalizeLeadMode(CFG.globalLeadMode),
+          globalLeadMultiplier: normalizeMultPreset(CFG.globalLeadMultiplier),
           zeroDelay: Boolean(CFG.zeroDelay),
           zeroDelayMicroMs: Math.max(0, Math.min(5, Number(CFG.zeroDelayMicroMs) || 0)),
           holdMs: (CFG.humanTap && !CFG.zeroDelay) ? 35 : 0,
@@ -16443,8 +17116,10 @@
           'var tEarlyWait=(autoHOn&&tFlightAge>=0&&tFlightAge<(hEnv.minFlightMs||125))?Math.min(180,Math.round((hEnv.minFlightMs||125)-tFlightAge)):0;' +
           'var tTotPre=tPreJit+tEarlyWait;' +
           'var tHumanSpan=Number((tTotPre+effHold+tPostJit).toFixed(2));' +
-          'if(outMeta){outMeta._el=btn||hit;outMeta.preText=cleanPreTxt;outMeta.disabled=preBtnDis;outMeta.tag=btn?btn.tagName:"";outMeta.clickX=evX;outMeta.clickY=evY;outMeta.jittered=Boolean(tJit.jittered);outMeta.fpSalt=fpProf?fpProf.salt:"";outMeta.fpPressure=fpProf?fpProf.pr:0;outMeta.fpRadius=fpProf?fpProf.rx:0;outMeta.humanSpanMs=tHumanSpan;}' +
-          'else if(CM_SYM){try{defHide(window,CM_SYM,{preText:cleanPreTxt,disabled:preBtnDis,tag:btn?btn.tagName:"",clickX:evX,clickY:evY,jittered:Boolean(tJit.jittered),fpSalt:fpProf?fpProf.salt:"",fpPressure:fpProf?fpProf.pr:0,fpRadius:fpProf?fpProf.rx:0,humanSpanMs:tHumanSpan});}catch(e){}}' +
+          'if(outMeta){outMeta._el=btn||hit;outMeta.preText=cleanPreTxt;outMeta.disabled=preBtnDis;outMeta.tag=btn?btn.tagName:"";outMeta.clickX=evX;outMeta.clickY=evY;outMeta.jittered=Boolean(tJit.jittered);outMeta.fpSalt=fpProf?fpProf.salt:"";outMeta.fpPressure=fpProf?fpProf.pr:0;outMeta.fpRadius=fpProf?fpProf.rx:0;outMeta.humanSpanMs=tHumanSpan;outMeta.dryRun=(tCfg.clickEnabled===false);}' +
+          'else if(CM_SYM){try{defHide(window,CM_SYM,{preText:cleanPreTxt,disabled:preBtnDis,tag:btn?btn.tagName:"",clickX:evX,clickY:evY,jittered:Boolean(tJit.jittered),fpSalt:fpProf?fpProf.salt:"",fpPressure:fpProf?fpProf.pr:0,fpRadius:fpProf?fpProf.rx:0,humanSpanMs:tHumanSpan,dryRun:(tCfg.clickEnabled===false)});}catch(e){}}' +
+          'try{document.dispatchEvent(new CustomEvent("__TT_PAGE_RGB_START__",{detail:JSON.stringify({x:evX,y:evY,preText:cleanPreTxt,reason:"PAGE_CLICK"})}));}catch(ergb){}' +
+          'if(tCfg.clickEnabled===false){if(typeof onDone==="function"){try{onDone(true,performance.now());}catch(edr){}}return true;}' +
           'var pid=fpProf?fpProf.pid:(nextPid=(nextPid%9000)+1);' +
           'var sx=fpProf?Number((evX+(win.screenX||0)).toFixed(2)):Math.round(x+(win.screenX||0)),sy=fpProf?Number((evY+(win.screenY||0)).toFixed(2)):Math.round(y+(win.screenY||0));' +
           'var px=fpProf?Number((evX+(win.scrollX||0)).toFixed(2)):Math.round(x+(win.scrollX||0)),py=fpProf?Number((evY+(win.scrollY||0)).toFixed(2)):Math.round(y+(win.scrollY||0));' +
@@ -16583,7 +17258,7 @@
             'if(!clickReleased){clickReleased=true;if(clickLockAdded&&typeof unlockFrame==="function")unlockFrame(gTgt,gSt,0);}' +
             'return null;' +
           '}' +
-          'var isWrongBtn=Boolean(meta.btnWrong||tIsWrongBtnState(meta.preText,meta.disabled,meta.btnEl));' +
+          'var isWrongBtn=Boolean(tCfg.clickEnabled!==false&&!meta.dryRun&&(meta.btnWrong||tIsWrongBtnState(meta.preText,meta.disabled,meta.btnEl)));' +
           'if(isWrongBtn&&!isRetryCall){' +
             'if(!clickReleased){clickReleased=true;if(clickLockAdded&&typeof unlockFrame==="function")unlockFrame(gTgt,gSt,0);}' +
             'tClearRetry();var rTries=38,tRetryBusy=false,tCachedBtn=(meta._el&&meta._el.isConnected)?meta._el:((meta.btnEl&&meta.btnEl.isConnected)?meta.btnEl:null);' +
@@ -16712,7 +17387,7 @@
         '}' +
         'function onPageDirectCashout(ev){' +
           'try{' +
-            'if(tCfg.directWsCashout===false)return;' +
+            'if(tCfg.clickEnabled===false||tCfg.directWsCashout===false)return;' +
             'var nowD=Date.now();' +
             'if(tRoundSawCrash||(nowD-tLastRoundCrashAt<4000)||(nowD-tLastOutCashAt<1500)||(nowD-tLastCashAckAt<2500))return;' +
             'if(nowD-(window.__ttLastDirectCashAt||0)<1500)return;' +
@@ -18929,7 +19604,7 @@
       let sbLastDirectCashAt = 0;
       const onSbDirectCashout = (ev) => {
         try {
-          if (pageWorldActive || targetWin.__ttPageHooked || window.__ttPageHooked || CFG.directWsCashout === false) return;
+          if (CFG.clickEnabled === false || pageWorldActive || targetWin.__ttPageHooked || window.__ttPageHooked || CFG.directWsCashout === false) return;
           const nowD = Date.now();
           if ((CFG.roundOnce && roundSawCrashAfterLock) || (nowD - lastRoundCrashAt < 4000) || (nowD - lastOutCashSentAt < 1500) || (nowD - lastCashAckAt < 2500)) return;
           if (nowD - sbLastDirectCashAt < 1500) return;
@@ -19593,6 +20268,7 @@
       if (CFG.hotkeyCode === 'Space') e.preventDefault();
       if (elTags && elTags.value !== CFG.tags) CFG.tags = elTags.value;
       CFG.armed = !CFG.armed;
+      if (!CFG.armed && typeof stopTargetRgbBlink === 'function') stopTargetRgbBlink('HOTKEY_TOGGLE_OFF', false);
       if (lastHitTag === 'TEST') lastHitTag = '';
       cancelPredictivePreTrigger('HOTKEY_TOGGLE');
       preTriggerFiredThisRound = false;
@@ -19837,6 +20513,9 @@
 
   const destroyFn = function () {
     CFG.armed = false;
+    try { if (typeof stopTargetRgbBlink === 'function') stopTargetRgbBlink('DESTROY', true); } catch {}
+    if (rgbHaloEl && rgbHaloEl.parentNode) { try { rgbHaloEl.parentNode.removeChild(rgbHaloEl); } catch {} rgbHaloEl = null; }
+    if (rgbStyleEl && rgbStyleEl.parentNode) { try { rgbStyleEl.parentNode.removeChild(rgbStyleEl); } catch {} rgbStyleEl = null; }
     cancelPredictivePreTrigger('DESTROY');
     if (histPredSaveTimer) { clearTimeout(histPredSaveTimer); histPredSaveTimer = 0; }
     try { if (histPredDirty) flushHistoricalTagPredictions(); } catch {}

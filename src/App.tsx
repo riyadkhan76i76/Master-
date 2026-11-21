@@ -26,8 +26,10 @@ import {
   Zap,
 } from 'lucide-react';
 import {
+  AUTO_LEAD_MULTIPLIER_PRESETS,
   inspectCashoutButtonState,
   timingCalibrationEngine,
+  type TagLeadMode,
   type TimingEngineSnapshot,
 } from './utils/timingEngine';
 import {
@@ -37,6 +39,7 @@ import {
   type HumanMimicJitterConfig,
   type StreamTransport,
 } from './utils/violentmonkeyBridge';
+import { ToastContainer, type VerificationToastItem } from './components/ToastContainer';
 
 type NavSection = 'monitor' | 'verify' | 'config' | 'userscript';
 type TransportFilter = 'ALL' | StreamTransport;
@@ -95,6 +98,22 @@ const INITIAL_CHECKS: SubsystemCheckResult[] = [
     summary: 'Feeds server acceptance RTT, human tap duration & deficit samples and verifies dynamic scaling past 5x (up to 12x).',
     details: [],
   },
+  {
+    id: 'click-switch-rgb',
+    title: 'Click Switch OFF (RGB-Only) & Cash/Crash Auto-Stop',
+    module: 'src/utils/violentmonkeyBridge.ts + src/index.css',
+    status: 'idle',
+    summary: 'Verifies Master Click Switch OFF blocks real clicks while blinking extra-bright RGB LED on target button until CASH/CRASH stops it.',
+    details: [],
+  },
+  {
+    id: 'lead-modes-calibration',
+    title: 'Flexible Lead Modes: Auto + 1x..12x + Custom ms',
+    module: 'src/utils/timingEngine.ts',
+    status: 'idle',
+    summary: 'Verifies manual presets (1x, 2x, 5x, 6x, 12x), custom ms locking against BOT_REJECTED clobber, and Auto fallback.',
+    details: [],
+  },
 ];
 
 function transportTone(t: StreamTransport): string {
@@ -136,12 +155,49 @@ export default function App() {
 
   const [checks, setChecks] = useState<SubsystemCheckResult[]>(INITIAL_CHECKS);
   const [runningAllChecks, setRunningAllChecks] = useState(false);
+  const [toasts, setToasts] = useState<VerificationToastItem[]>([]);
+  const toastTimersRef = useRef<Map<string, number>>(new Map());
+
+  const [leadModeInput, setLeadModeInput] = useState<TagLeadMode>(() => timingSnap.globalLeadMode);
+  const [leadMultInput, setLeadMultInput] = useState<number>(() => timingSnap.globalLeadMultiplier);
+  const [leadMsInput, setLeadMsInput] = useState<number>(() => timingSnap.globalManualLeadMs);
+
+  const [overrideTagInput, setOverrideTagInput] = useState<string>('CASHOUT');
+  const [overrideModeInput, setOverrideModeInput] = useState<TagLeadMode>('manual_mult');
+  const [overrideMultInput, setOverrideMultInput] = useState<number>(6);
+  const [overrideMsInput, setOverrideMsInput] = useState<number>(140);
 
   const [userscriptText, setUserscriptText] = useState<string>('');
   const [userscriptLoading, setUserscriptLoading] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState<string>('');
 
   const stagingHostRef = useRef<HTMLDivElement | null>(null);
+  const previewBtnRef = useRef<HTMLButtonElement | null>(null);
+
+  const dismissToast = (id: string) => {
+    const timer = toastTimersRef.current.get(id);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      toastTimersRef.current.delete(id);
+    }
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  };
+
+  const pushVerificationToast = (title: string, summary: string, durationMs?: number) => {
+    const id = `toast_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const item: VerificationToastItem = {
+      id,
+      title,
+      summary,
+      durationMs,
+      createdAt: Date.now(),
+    };
+    setToasts((prev) => [item, ...prev].slice(0, 4));
+    const timer = window.setTimeout(() => {
+      dismissToast(id);
+    }, 4500);
+    toastTimersRef.current.set(id, timer);
+  };
 
   useEffect(() => {
     const unsubTiming = timingCalibrationEngine.subscribe(setTimingSnap);
@@ -150,6 +206,10 @@ export default function App() {
     const uninstallNet = violentmonkeyBridge.installTelemetryInterceptors();
 
     return () => {
+      for (const timer of toastTimersRef.current.values()) {
+        window.clearTimeout(timer);
+      }
+      toastTimersRef.current.clear();
       unsubTiming();
       unsubBridge();
       disconnectGm();
@@ -192,6 +252,14 @@ export default function App() {
 
   const updateCheck = (id: string, patch: Partial<SubsystemCheckResult>) => {
     setChecks((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));
+    if (patch.status === 'pass') {
+      const def = INITIAL_CHECKS.find((c) => c.id === id);
+      pushVerificationToast(
+        `Passed: ${def?.title || id}`,
+        patch.summary || 'Verification passed cleanly.',
+        patch.durationMs,
+      );
+    }
   };
 
   const runSingleCheck = async (id: string) => {
@@ -205,7 +273,7 @@ export default function App() {
 
         const btn = document.createElement('button');
         btn.type = 'button';
-        btn.className = 'cashout_btn btn_off';
+        btn.className = 'cashout_btn btn_off w-36 h-11';
         btn.disabled = true;
         btn.setAttribute('data-state', 'off');
         btn.textContent = 'WAIT';
@@ -231,6 +299,7 @@ export default function App() {
 
         const result = await violentmonkeyBridge.dispatchHumanMimicClick(btn, {
           tag: 'CHECK_BTN_OFF',
+          forceRealClick: true,
           jitter: {
             ...jitterCfg,
             retryOnBtnOff: true,
@@ -241,6 +310,7 @@ export default function App() {
 
         window.clearTimeout(releaseTimer);
         unsubWatch();
+        violentmonkeyBridge.stopRgbBlink('CHECK_DONE', btn);
         host.removeChild(btn);
 
         const snapNow = timingCalibrationEngine.getSnapshot();
@@ -270,7 +340,7 @@ export default function App() {
 
         const btn = document.createElement('button');
         btn.type = 'button';
-        btn.className = 'cashout_btn';
+        btn.className = 'cashout_btn w-36 h-11';
         btn.textContent = 'Cash Out 3.10x';
         host.appendChild(btn);
 
@@ -283,6 +353,7 @@ export default function App() {
 
         const res1 = await violentmonkeyBridge.dispatchHumanMimicClick(btn, {
           tag: 'CHECK_JITTER_1',
+          forceRealClick: true,
           jitter: {
             ...jitterCfg,
             enabled: true,
@@ -297,6 +368,7 @@ export default function App() {
         });
         const res2 = await violentmonkeyBridge.dispatchHumanMimicClick(btn, {
           tag: 'CHECK_JITTER_2',
+          forceRealClick: true,
           jitter: {
             ...jitterCfg,
             enabled: true,
@@ -311,6 +383,7 @@ export default function App() {
         });
 
         trackedTypes.forEach((evt) => btn.removeEventListener(evt, handler));
+        violentmonkeyBridge.stopRgbBlink('CHECK_DONE', btn);
         host.removeChild(btn);
 
         // Verify closed-loop BOT_REJECTED auto-escalation on a temporary engine instance
@@ -333,7 +406,7 @@ export default function App() {
           orderedNames.includes('pointerup') &&
           orderedNames.includes('click');
         const hasRealisticSpan = res1.holdJitterMs >= 7 && res1.totalDispatchMs > res1.holdJitterMs;
-        const coordsVaried = res1.clickX !== res2.clickX || res1.clickY !== res2.clickY || true;
+        const coordsVaried = res1.clickX !== res2.clickX || res1.clickY !== res2.clickY;
         const passed = res1.dispatched && res2.dispatched && hasAllCore && hasRealisticSpan && coordsVaried && escalatedUp;
 
         updateCheck(id, {
@@ -351,8 +424,9 @@ export default function App() {
           ],
         });
       } else if (id === 'consolidated-net') {
-        const beforeFetch = bridgeSnap.totalByTransport.FETCH;
-        const beforeXhr = bridgeSnap.totalByTransport.XHR;
+        const snapBefore = violentmonkeyBridge.getSnapshot();
+        const beforeFetch = snapBefore.totalByTransport.FETCH;
+        const beforeXhr = snapBefore.totalByTransport.XHR;
 
         // 1. Live Fetch HEAD request
         const fetchRes = await fetch(`${USERSCRIPT_PUBLIC_PATH}?probe=fetch_${Date.now()}`, {
@@ -370,7 +444,7 @@ export default function App() {
         });
 
         // Flush batcher so counters update deterministically
-        await new Promise((r) => setTimeout(r, bridgeSnap.batcher.batchIntervalMs + 30));
+        await new Promise((r) => setTimeout(r, snapBefore.batcher.batchIntervalMs + 30));
         violentmonkeyBridge.flushPendingBatch();
 
         const snapAfter = violentmonkeyBridge.getSnapshot();
@@ -393,9 +467,10 @@ export default function App() {
           ],
         });
       } else if (id === 'batch-coalesce') {
-        const beforeIngested = bridgeSnap.batcher.totalIngested;
-        const beforeFlushes = bridgeSnap.batcher.totalFlushes;
-        const beforeSaved = bridgeSnap.batcher.coalescedFramesSaved;
+        const snapBefore = violentmonkeyBridge.getSnapshot();
+        const beforeIngested = snapBefore.batcher.totalIngested;
+        const beforeFlushes = snapBefore.batcher.totalFlushes;
+        const beforeSaved = snapBefore.batcher.coalescedFramesSaved;
 
         const burstCount = 300;
         const stamp = Date.now();
@@ -409,7 +484,7 @@ export default function App() {
           });
         }
 
-        await new Promise((r) => setTimeout(r, bridgeSnap.batcher.batchIntervalMs + 45));
+        await new Promise((r) => setTimeout(r, snapBefore.batcher.batchIntervalMs + 45));
         violentmonkeyBridge.flushPendingBatch();
 
         const snapAfter = violentmonkeyBridge.getSnapshot();
@@ -481,6 +556,128 @@ export default function App() {
             `Recommended PreTrig lead: ${latest.recommendedLeadMs}ms (includes auto-human tap compensation)`,
           ],
         });
+      } else if (id === 'click-switch-rgb') {
+        const host = stagingHostRef.current;
+        if (!host) throw new Error('Staging host unavailable');
+
+        const prevClickEnabled = violentmonkeyBridge.isClickEnabled();
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'cashout_btn w-36 h-11';
+        btn.textContent = 'Cash Out 2.00x';
+        host.appendChild(btn);
+
+        let nativeClickCount = 0;
+        btn.addEventListener('click', () => {
+          nativeClickCount += 1;
+        });
+
+        violentmonkeyBridge.setClickEnabled(false, false);
+        const offResult = await violentmonkeyBridge.dispatchHumanMimicClick(btn, { tag: 'CHECK_RGB_OFF' });
+        const hasRgbWhileOff =
+          btn.classList.contains('tt-rgb-led-active') && violentmonkeyBridge.getSnapshot().rgbBlinkActive;
+
+        // Simulate game cashout packet -> RGB blink must stop automatically
+        violentmonkeyBridge.ingestTelemetry({
+          transport: 'WS',
+          src: 'WS-IN',
+          direction: 'IN',
+          text: '{"event":"CASH","status":"CASHED","mult":2.05}',
+        });
+        const stoppedOnCash =
+          !btn.classList.contains('tt-rgb-led-active') && !violentmonkeyBridge.getSnapshot().rgbBlinkActive;
+
+        // Re-enable Click Switch and verify click fires + RGB activates, then CRASH stops RGB
+        violentmonkeyBridge.setClickEnabled(true, false);
+        const onResult = await violentmonkeyBridge.dispatchHumanMimicClick(btn, {
+          tag: 'CHECK_RGB_ON',
+          jitter: { ...jitterCfg, enabled: false },
+        });
+        const hasRgbWhileOn =
+          btn.classList.contains('tt-rgb-led-active') && violentmonkeyBridge.getSnapshot().rgbBlinkActive;
+
+        violentmonkeyBridge.ingestTelemetry({
+          transport: 'WS',
+          src: 'WS-IN',
+          direction: 'IN',
+          text: '{"event":"CRASH","status":"ROUND_END","mult":2.41}',
+        });
+        const stoppedOnCrash =
+          !btn.classList.contains('tt-rgb-led-active') && !violentmonkeyBridge.getSnapshot().rgbBlinkActive;
+
+        violentmonkeyBridge.setClickEnabled(prevClickEnabled, false);
+        host.removeChild(btn);
+
+        const passed =
+          offResult.dryRun === true &&
+          !offResult.dispatched &&
+          nativeClickCount === 1 &&
+          hasRgbWhileOff &&
+          stoppedOnCash &&
+          onResult.dispatched &&
+          hasRgbWhileOn &&
+          stoppedOnCrash;
+
+        updateCheck(id, {
+          status: passed ? 'pass' : 'fail',
+          durationMs: Number((performance.now() - t0).toFixed(2)),
+          summary: passed
+            ? 'Click OFF blocked DOM click (0 clicks) while blinking RGB LED; Click ON fired 1 click; CASH & CRASH stopped RGB.'
+            : `Switch/RGB check mismatch (dryRun=${Boolean(offResult.dryRun)}, clicks=${nativeClickCount}, cashStop=${stoppedOnCash}, crashStop=${stoppedOnCrash}).`,
+          details: [
+            `Click OFF -> dryRun=${String(offResult.dryRun)}, nativeClicksBeforeOn=${nativeClickCount === 1 ? '0 (suppressed)' : 'unexpected'}, RGB=${hasRgbWhileOff ? 'BLINKING' : 'OFF'}`,
+            `Game CASH packet -> RGB auto-stopped: ${stoppedOnCash ? 'YES' : 'NO'}`,
+            `Click ON -> dispatched=${String(onResult.dispatched)}, RGB=${hasRgbWhileOn ? 'BLINKING' : 'OFF'}`,
+            `Game CRASH packet -> RGB auto-stopped: ${stoppedOnCrash ? 'YES' : 'NO'}`,
+          ],
+        });
+      } else if (id === 'lead-modes-calibration') {
+        const snapBefore = timingCalibrationEngine.getSnapshot();
+        const tag = 'CHECK_LEAD_MODES';
+
+        timingCalibrationEngine.setTagLeadOverride(tag, 'manual_mult', 1, 100);
+        const m1 = timingCalibrationEngine.getEffectiveLeadForTag(tag);
+        timingCalibrationEngine.setTagLeadOverride(tag, 'manual_mult', 2, 100);
+        const m2 = timingCalibrationEngine.getEffectiveLeadForTag(tag);
+        timingCalibrationEngine.setTagLeadOverride(tag, 'manual_mult', 5, 100);
+        const m5 = timingCalibrationEngine.getEffectiveLeadForTag(tag);
+        timingCalibrationEngine.setTagLeadOverride(tag, 'manual_mult', 6, 100);
+        const m6 = timingCalibrationEngine.getEffectiveLeadForTag(tag);
+        timingCalibrationEngine.setTagLeadOverride(tag, 'manual_mult', 12, 100);
+        const m12 = timingCalibrationEngine.getEffectiveLeadForTag(tag);
+
+        timingCalibrationEngine.setTagLeadOverride(tag, 'manual_ms', 6, 235);
+        const profBefore = { ...timingCalibrationEngine.getAutoHumanProfile() };
+        timingCalibrationEngine.recordServerClickFeedback({ outcome: 'BOT_REJECTED', errText: 'test' });
+        const customAfterReject = timingCalibrationEngine.getEffectiveLeadForTag(tag);
+        timingCalibrationEngine.applyExternalAutoHumanProfile(profBefore);
+        timingCalibrationEngine.removeTagLeadOverride(tag);
+        timingCalibrationEngine.setGlobalLeadConfig(
+          snapBefore.globalLeadMode,
+          snapBefore.globalLeadMultiplier,
+          snapBefore.globalManualLeadMs,
+        );
+
+        const monotonicMult =
+          m1.leadMs < m2.leadMs &&
+          m2.leadMs < m5.leadMs &&
+          m5.leadMs < m6.leadMs &&
+          m6.leadMs < m12.leadMs;
+        const customLocked =
+          customAfterReject.mode === 'manual_ms' && customAfterReject.leadMs === 235;
+        const passed = monotonicMult && customLocked;
+
+        updateCheck(id, {
+          status: passed ? 'pass' : 'fail',
+          durationMs: Number((performance.now() - t0).toFixed(2)),
+          summary: passed
+            ? `Lead scaling verified: 1x=${m1.leadMs}ms < 2x=${m2.leadMs}ms < 5x=${m5.leadMs}ms < 6x=${m6.leadMs}ms < 12x=${m12.leadMs}ms; custom 235ms locked.`
+            : 'Manual multiplier scaling or custom ms lock failed.',
+          details: [
+            `Presets -> 1x:${m1.leadMs}ms · 2x:${m2.leadMs}ms · 5x:${m5.leadMs}ms · 6x:${m6.leadMs}ms · 12x:${m12.leadMs}ms`,
+            `Custom ms override (235ms) after BOT_REJECTED feedback: ${customAfterReject.leadMs}ms (mode=${customAfterReject.mode})`,
+          ],
+        });
       }
     } catch (err) {
       updateCheck(id, {
@@ -508,9 +705,22 @@ export default function App() {
     violentmonkeyBridge.setBatchIntervalMs(batchIntervalInput);
     violentmonkeyBridge.setJitterConfig(jitterCfg);
     timingCalibrationEngine.setAutoHumanClickEnabled(jitterCfg.autoScale !== false);
+    timingCalibrationEngine.setGlobalLeadConfig(leadModeInput, leadMultInput, leadMsInput);
     const prof = timingCalibrationEngine.getAutoHumanProfile();
+    const tSnap = timingCalibrationEngine.getSnapshot();
+    const tagOvRecord: Record<string, { mode: TagLeadMode; multiplier: number; manualMs: number }> = {};
+    for (const ov of tSnap.tagOverrides) {
+      tagOvRecord[ov.tag] = { mode: ov.mode, multiplier: ov.multiplier, manualMs: ov.manualMs };
+    }
     violentmonkeyBridge.pushConfigToUserscript(
       {
+        clickEnabled: bridgeSnap.clickEnabled,
+        globalLeadMode: tSnap.globalLeadMode,
+        globalLeadMultiplier: tSnap.globalLeadMultiplier,
+        autoLead3xEnabled: tSnap.globalLeadMode !== 'manual_ms',
+        predictivePreTriggerLeadMs: tSnap.globalManualLeadMs,
+        predictiveLeadTimeMs: tSnap.globalManualLeadMs,
+        tagLeadOverrides: tagOvRecord,
         batchIntervalMs: batchIntervalInput,
         humanMimicJitter: jitterCfg.enabled,
         autoHumanClick: jitterCfg.autoScale !== false,
@@ -535,8 +745,33 @@ export default function App() {
       },
       roomInput,
     );
-    setConfigStatus('Applied locally and pushed Auto-Human envelope + timing config to Violentmonkey.');
+    setConfigStatus('Applied locally and pushed Click Switch, Lead Mode/Overrides & Auto-Human config to Violentmonkey.');
     window.setTimeout(() => setConfigStatus(''), 3500);
+  };
+
+  const handleToggleClickSwitch = () => {
+    violentmonkeyBridge.setClickEnabled(!bridgeSnap.clickEnabled, true);
+  };
+
+  const handleTriggerPreviewCashout = async () => {
+    const btn = previewBtnRef.current;
+    if (!btn) return;
+    await violentmonkeyBridge.dispatchHumanMimicClick(btn, { tag: 'CASHOUT_PREVIEW' });
+  };
+
+  const handleSimulateGameEnd = (kind: 'CASH' | 'CRASH') => {
+    violentmonkeyBridge.ingestTelemetry({
+      transport: 'WS',
+      src: 'WS-IN',
+      direction: 'IN',
+      matched: true,
+      matchedTag: kind,
+      text:
+        kind === 'CASH'
+          ? '{"event":"CASH","status":"CASHED","mult":2.45}'
+          : '{"event":"CRASH","status":"ROUND_END","mult":1.87}',
+    });
+    violentmonkeyBridge.flushPendingBatch();
   };
 
   const handleDownloadUserscript = async () => {
@@ -720,6 +955,23 @@ export default function App() {
           <div className="flex items-center gap-2 shrink-0">
             <button
               type="button"
+              onClick={handleToggleClickSwitch}
+              title="Master Click Switch: OFF suppresses clicks while keeping extra-bright RGB LED blink active"
+              className={`whitespace-nowrap shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-mono font-semibold border transition-colors ${
+                bridgeSnap.clickEnabled
+                  ? 'bg-emerald-950/70 border-emerald-600/70 text-emerald-300 hover:bg-emerald-900/70'
+                  : 'bg-amber-950/70 border-amber-500/70 text-amber-300 hover:bg-amber-900/70'
+              }`}
+            >
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  bridgeSnap.clickEnabled ? 'bg-emerald-400' : 'bg-amber-400 animate-pulse'
+                }`}
+              />
+              {bridgeSnap.clickEnabled ? 'Click: ON' : 'Click: OFF (RGB Only)'}
+            </button>
+            <button
+              type="button"
               onClick={() => violentmonkeyBridge.pullFromUserscript(bridgeSnap.roomId)}
               className="whitespace-nowrap shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700 transition-colors"
             >
@@ -741,6 +993,59 @@ export default function App() {
         <main className="flex-1 p-4 sm:p-6 space-y-5 max-w-[1440px] w-full mx-auto">
           {activeNav === 'monitor' && (
             <>
+              {/* Compact RGB LED & Click Switch / Lead Control Bar */}
+              <section className="border border-slate-800 rounded-lg bg-slate-900 px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-3">
+                  <button
+                    ref={previewBtnRef}
+                    type="button"
+                    onClick={() => void handleTriggerPreviewCashout()}
+                    className={`px-3.5 py-1.5 rounded-md text-xs font-semibold border transition-all ${
+                      bridgeSnap.rgbBlinkActive
+                        ? 'tt-rgb-led-active bg-fuchsia-950/80 text-white border-white'
+                        : 'bg-slate-950 hover:bg-slate-800 text-slate-100 border-slate-700'
+                    }`}
+                  >
+                    Trigger Target Cash Out
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleSimulateGameEnd('CASH')}
+                    disabled={!bridgeSnap.rgbBlinkActive}
+                    className="px-2.5 py-1.5 rounded text-xs font-mono bg-emerald-950/60 hover:bg-emerald-900/60 disabled:opacity-40 text-emerald-300 border border-emerald-700/60 transition-colors"
+                  >
+                    Simulate Cash Out
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleSimulateGameEnd('CRASH')}
+                    disabled={!bridgeSnap.rgbBlinkActive}
+                    className="px-2.5 py-1.5 rounded text-xs font-mono bg-rose-950/60 hover:bg-rose-900/60 disabled:opacity-40 text-rose-300 border border-rose-700/60 transition-colors"
+                  >
+                    Simulate Crash
+                  </button>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-3 text-xs font-mono">
+                  <span
+                    className={`px-2 py-1 rounded border ${
+                      bridgeSnap.rgbBlinkActive
+                        ? 'border-fuchsia-400/70 bg-fuchsia-950/60 text-fuchsia-200 animate-pulse'
+                        : 'border-slate-800 bg-slate-950 text-slate-400'
+                    }`}
+                  >
+                    RGB LED: {bridgeSnap.rgbBlinkActive ? `BLINKING (${bridgeSnap.rgbBlinkReason})` : 'IDLE'}
+                  </span>
+                  <span className="px-2 py-1 rounded border border-slate-800 bg-slate-950 text-cyan-300">
+                    Lead:{' '}
+                    {timingSnap.globalLeadMode === 'auto'
+                      ? `Auto (${timingSnap.globalLeadMultiplier}x)`
+                      : timingSnap.globalLeadMode === 'manual_mult'
+                        ? `${timingSnap.globalLeadMultiplier}x`
+                        : `${timingSnap.globalManualLeadMs}ms`}
+                  </span>
+                </div>
+              </section>
               {/* Flat 4-Column Telemetry Strip (Single Elevation Surface, No Nested Cards) */}
               <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 border border-slate-800 rounded-lg bg-slate-900 divide-y sm:divide-y-0 sm:divide-x divide-slate-800 overflow-hidden">
                 {/* 1. Retry Queue Depth & Sub-ms Check Telemetry */}
@@ -1152,7 +1457,7 @@ export default function App() {
                   className="whitespace-nowrap shrink-0 inline-flex items-center gap-2 px-3.5 py-2 rounded-md text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-slate-950 transition-colors"
                 >
                   <Play className="w-3.5 h-3.5" />
-                  {runningAllChecks ? 'Running All Checks...' : 'Run All 5 Checks'}
+                  {runningAllChecks ? 'Running All Checks...' : `Run All ${INITIAL_CHECKS.length} Checks`}
                 </button>
               </div>
 
@@ -1447,6 +1752,195 @@ export default function App() {
                   </div>
                 </div>
               </div>
+
+              {/* Master Click Switch & Flexible Lead Timing (Auto + 1x..12x + Custom ms + Per-Tag) */}
+              <div className="border-t border-slate-800 pt-5 grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between gap-2">
+                    <h3 className="text-xs font-mono uppercase tracking-wider text-slate-400">
+                      Master Click Switch &amp; Global Lead Timing
+                    </h3>
+                    <button
+                      type="button"
+                      onClick={handleToggleClickSwitch}
+                      className={`px-3 py-1 rounded text-xs font-mono font-semibold border transition-colors ${
+                        bridgeSnap.clickEnabled
+                          ? 'bg-emerald-950/70 border-emerald-600/70 text-emerald-300'
+                          : 'bg-amber-950/70 border-amber-500/70 text-amber-300'
+                      }`}
+                    >
+                      {bridgeSnap.clickEnabled ? 'Click Switch: ON' : 'Click Switch: OFF (RGB Only)'}
+                    </button>
+                  </div>
+
+                  <div className="flex flex-wrap gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setLeadModeInput('auto');
+                        timingCalibrationEngine.setGlobalLeadConfig('auto', leadMultInput, leadMsInput);
+                      }}
+                      className={`px-2.5 py-1.5 rounded text-xs font-mono border transition-colors ${
+                        leadModeInput === 'auto'
+                          ? 'bg-emerald-600 text-slate-950 font-semibold border-emerald-500'
+                          : 'bg-slate-950 text-slate-300 border-slate-800 hover:border-slate-700'
+                      }`}
+                    >
+                      Auto (3x→12x)
+                    </button>
+                    {AUTO_LEAD_MULTIPLIER_PRESETS.map((mult) => {
+                      const active = leadModeInput === 'manual_mult' && leadMultInput === mult;
+                      return (
+                        <button
+                          key={mult}
+                          type="button"
+                          onClick={() => {
+                            setLeadModeInput('manual_mult');
+                            setLeadMultInput(mult);
+                            timingCalibrationEngine.setGlobalLeadConfig('manual_mult', mult, leadMsInput);
+                          }}
+                          className={`px-2.5 py-1.5 rounded text-xs font-mono border transition-colors ${
+                            active
+                              ? 'bg-cyan-500 text-slate-950 font-semibold border-cyan-400'
+                              : 'bg-slate-950 text-slate-300 border-slate-800 hover:border-slate-700'
+                          }`}
+                        >
+                          {mult}x
+                        </button>
+                      );
+                    })}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setLeadModeInput('manual_ms');
+                        timingCalibrationEngine.setGlobalLeadConfig('manual_ms', leadMultInput, leadMsInput);
+                      }}
+                      className={`px-2.5 py-1.5 rounded text-xs font-mono border transition-colors ${
+                        leadModeInput === 'manual_ms'
+                          ? 'bg-amber-500 text-slate-950 font-semibold border-amber-400'
+                          : 'bg-slate-950 text-slate-300 border-slate-800 hover:border-slate-700'
+                      }`}
+                    >
+                      Custom ms
+                    </button>
+                  </div>
+
+                  <label className="block space-y-1">
+                    <span className="text-xs text-slate-400">Global Custom Pre-Trigger Lead (ms)</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={30000}
+                      step={5}
+                      value={leadMsInput}
+                      onChange={(e) => {
+                        const val = Math.max(0, Math.min(30000, Number(e.target.value) || 0));
+                        setLeadMsInput(val);
+                        if (leadModeInput === 'manual_ms') {
+                          timingCalibrationEngine.setGlobalLeadConfig('manual_ms', leadMultInput, val);
+                        }
+                      }}
+                      className="w-full px-2.5 py-1.5 rounded bg-slate-950 border border-slate-800 text-xs font-mono text-slate-100"
+                    />
+                  </label>
+                </div>
+
+                {/* Per-Tag Lead Override */}
+                <div className="space-y-3">
+                  <h3 className="text-xs font-mono uppercase tracking-wider text-slate-400">
+                    Per-Tag Lead Timing Override
+                  </h3>
+                  <div className="grid grid-cols-1 sm:grid-cols-4 gap-2">
+                    <input
+                      type="text"
+                      value={overrideTagInput}
+                      onChange={(e) => setOverrideTagInput(e.target.value)}
+                      placeholder="Tag name"
+                      className="px-2.5 py-1.5 rounded bg-slate-950 border border-slate-800 text-xs font-mono text-slate-100"
+                    />
+                    <select
+                      value={overrideModeInput}
+                      onChange={(e) => setOverrideModeInput(e.target.value as TagLeadMode)}
+                      className="px-2.5 py-1.5 rounded bg-slate-950 border border-slate-800 text-xs font-mono text-slate-100"
+                    >
+                      <option value="auto">Auto</option>
+                      <option value="manual_mult">Multiplier (1x-12x)</option>
+                      <option value="manual_ms">Custom ms</option>
+                    </select>
+                    {overrideModeInput === 'manual_mult' ? (
+                      <select
+                        value={overrideMultInput}
+                        onChange={(e) => setOverrideMultInput(Number(e.target.value))}
+                        className="px-2.5 py-1.5 rounded bg-slate-950 border border-slate-800 text-xs font-mono text-slate-100"
+                      >
+                        {AUTO_LEAD_MULTIPLIER_PRESETS.map((m) => (
+                          <option key={m} value={m}>
+                            {m}x
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        type="number"
+                        min={0}
+                        max={30000}
+                        step={5}
+                        disabled={overrideModeInput === 'auto'}
+                        value={overrideMsInput}
+                        onChange={(e) => setOverrideMsInput(Math.max(0, Math.min(30000, Number(e.target.value) || 0)))}
+                        className="px-2.5 py-1.5 rounded bg-slate-950 border border-slate-800 text-xs font-mono text-slate-100 disabled:opacity-40"
+                      />
+                    )}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        timingCalibrationEngine.setTagLeadOverride(
+                          overrideTagInput,
+                          overrideModeInput,
+                          overrideMultInput,
+                          overrideMsInput,
+                        )
+                      }
+                      className="px-3 py-1.5 rounded text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700"
+                    >
+                      Set Tag
+                    </button>
+                  </div>
+
+                  {timingSnap.tagOverrides.length > 0 && (
+                    <div className="divide-y divide-slate-800 rounded border border-slate-800 bg-slate-950 max-h-36 overflow-y-auto">
+                      {timingSnap.tagOverrides.map((ov) => {
+                        const eff = timingCalibrationEngine.getEffectiveLeadForTag(ov.tag);
+                        return (
+                          <div
+                            key={ov.tag}
+                            className="px-3 py-1.5 flex items-center justify-between gap-2 text-xs font-mono"
+                          >
+                            <span className="text-slate-200 truncate">{ov.tag}</span>
+                            <div className="flex items-center gap-2 shrink-0">
+                              <span className="text-cyan-300">
+                                {ov.mode === 'manual_ms'
+                                  ? `${ov.manualMs}ms`
+                                  : ov.mode === 'manual_mult'
+                                    ? `${ov.multiplier}x (~${eff.leadMs}ms)`
+                                    : `Auto (~${eff.leadMs}ms)`}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => timingCalibrationEngine.removeTagLeadOverride(ov.tag)}
+                                className="text-slate-400 hover:text-rose-400"
+                                aria-label={`Remove ${ov.tag} override`}
+                              >
+                                <X className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
             </section>
           )}
 
@@ -1530,6 +2024,7 @@ export default function App() {
           )}
         </main>
       </div>
+      <ToastContainer toasts={toasts} onDismiss={dismissToast} />
     </div>
   );
 }
