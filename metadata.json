@@ -1,0 +1,6 @@
+{
+  "name": "TriggerTap Relay Monitor",
+  "description": "Low-latency Violentmonkey telemetry relay monitor with sub-millisecond btn_off recursive retry, human-mimic click jitter, batched WebSocket/Fetch/XHR interception, and Auto3x timing calibration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
