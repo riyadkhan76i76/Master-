@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         TriggerTap Turbo v5.2.4 + PreTrig + Auto3x [VM-Pro]
-// @namespace    https://triggertap.local/ttv524-pretrig-auto3x
-// @version      5.2.4
+// @name         TriggerTap Turbo v5.2.5 + PreTrig + Auto10x +2xSignal [VM-Pro]
+// @namespace    https://triggertap.local/ttv525-pretrig-auto10x
+// @version      5.2.5
 // @description  Sub-millisecond WebSocket, Predictive Pre-Trigger, Historical Tag Prediction Engine, SFS2X/MsgPack/Gzip/Base64, CSS/JS/DOM/ShadowDOM/API RoundTag discovery & auto-click
 // @match        *://*/*
 // @include      *
@@ -67,7 +67,7 @@
     fingerprintShuffle: true,
     autoHumanClick: true,
     networkTap: true,
-    preClickGate: true,
+    preClickGate: false,
     wsLeadMs: 10,
     gateHoldMs: 30,
     holdEvents: "",
@@ -98,8 +98,9 @@
     manualTagPin: false,
     histTagPredEnabled: true,
     predictivePreTriggerEnabled: true,
-    predictivePreTriggerLeadMs: 100,
+    predictivePreTriggerLeadMs: 260,
     autoLead3xEnabled: true,
+    preSignal2xEnabled: true,
     clickEnabled: true,
     globalLeadMode: 'auto',
     globalLeadMultiplier: 3,
@@ -111,8 +112,12 @@
   const AUTO_LEAD_MIN_ROUNDS = 2;
   const AUTO_LEAD_MAX_ROUNDS = 12;
   const AUTO_LEAD_MULTIPLIER = 3;
-  const AUTO_LEAD_MAX_MULTIPLIER = 16;
-  const LEAD_MULTIPLIER_PRESETS = [1, 2, 3, 5, 6, 8, 10, 12];
+  const AUTO_LEAD_MAX_MULTIPLIER = 10;
+  const LATE_400_THRESHOLD_MS = 400;
+  const LATE_400_BASE_MS = 800;
+  const LATE_400_MULTIPLIER = 6;
+  const LATE_400_BOOST_MS = LATE_400_BASE_MS * LATE_400_MULTIPLIER;
+  const LEAD_MULTIPLIER_PRESETS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
   const BOT_BASE_URL = (CFG.relayUrl || '').replace(/\/+$/, '');
   const SHARED_BASE_URL = (BOT_BASE_URL.includes('ais-dev-')
@@ -783,6 +788,9 @@
       const savedAuto3x = sessionStorage.getItem('__tt_auto_lead_3x');
       if (savedAuto3x === '1') CFG.autoLead3xEnabled = true;
       else if (savedAuto3x === '0') CFG.autoLead3xEnabled = false;
+      const savedPreSig2x = sessionStorage.getItem('__tt_pre_sig_2x');
+      if (savedPreSig2x === '1') CFG.preSignal2xEnabled = true;
+      else if (savedPreSig2x === '0') CFG.preSignal2xEnabled = false;
       const savedClickOn = sessionStorage.getItem('__tt_click_enabled');
       if (savedClickOn === '1') CFG.clickEnabled = true;
       else if (savedClickOn === '0') CFG.clickEnabled = false;
@@ -814,6 +822,9 @@
           }
           if (typeof o.autoLead3xEnabled === 'boolean' && sessionStorage.getItem('__tt_auto_lead_3x') === null) {
             CFG.autoLead3xEnabled = o.autoLead3xEnabled;
+          }
+          if (typeof o.preSignal2xEnabled === 'boolean' && sessionStorage.getItem('__tt_pre_sig_2x') === null) {
+            CFG.preSignal2xEnabled = o.preSignal2xEnabled;
           }
           if (typeof o.clickEnabled === 'boolean' && sessionStorage.getItem('__tt_click_enabled') === null) {
             CFG.clickEnabled = o.clickEnabled;
@@ -884,6 +895,7 @@
     try { sessionStorage.setItem('__tt_pre_trig_on', CFG.predictivePreTriggerEnabled !== false ? '1' : '0'); } catch {}
     try { sessionStorage.setItem('__tt_pre_trig_lead', String(safeLeadMs)); } catch {}
     try { sessionStorage.setItem('__tt_auto_lead_3x', CFG.autoLead3xEnabled !== false ? '1' : '0'); } catch {}
+    try { sessionStorage.setItem('__tt_pre_sig_2x', CFG.preSignal2xEnabled !== false ? '1' : '0'); } catch {}
     try { sessionStorage.setItem('__tt_click_enabled', CFG.clickEnabled !== false ? '1' : '0'); } catch {}
     try { sessionStorage.setItem('__tt_global_lead_mode', safeLeadMode); } catch {}
     try { sessionStorage.setItem('__tt_global_lead_mult', String(safeLeadMult)); } catch {}
@@ -904,6 +916,7 @@
           predictivePreTriggerLeadMs: safeLeadMs,
           predictiveLeadTimeMs: safeLeadMs,
           autoLead3xEnabled: Boolean(CFG.autoLead3xEnabled !== false),
+          preSignal2xEnabled: Boolean(CFG.preSignal2xEnabled !== false),
           clickEnabled: Boolean(CFG.clickEnabled !== false),
           globalLeadMode: safeLeadMode,
           globalLeadMultiplier: safeLeadMult,
@@ -940,7 +953,13 @@
   let preTriggerSchedule = null;
   let preTriggerFiredThisRound = false;
   let preTriggerFiredAtMono = 0;
+  let preSignalTimerId = 0;
+  let preSignalSchedule = null;
+  let preSignalFiredThisRound = false;
+  let preSignalWindowInfo = null;
   let lastPreTriggerActualLeadMs = null;
+  let lastRoundCutoffMissedAt = 0;
+  let lastRoundMissStreak = 0;
   let tagFlightSeenInRound = false;
   let isDraggingTarget = false;
   let lastTriggerAt = 0;
@@ -2072,7 +2091,7 @@
           else if (cashStrSet.has(sv)) hasCash = true;
         } else if ((lk === 'coef' || lk === 'coeff' || lk === 'coefficient' || lk === 'multiplier' || lk === 'mult' || lk === 'mul' || lk === 'odds' || lk === 'rate') && !crashNumKeys.has(lk)) {
           const mv = typeof v === 'number' ? v : parseFloat(String(v).replace(/,/g, '').replace(/[x×%]/gi, '').trim());
-          if (Number.isFinite(mv) && mv > 1.005 && mv < 1000000) hasActiveFlight = true;
+          if (Number.isFinite(mv) && mv > 1.001 && mv < 1000000) hasActiveFlight = true;
         } else if (v && typeof v === 'object') {
           walkSafe(v, depth + 1);
         }
@@ -2238,7 +2257,7 @@
     const nums = [];
     for (let i = 0; i < offsetsArr.length; i++) {
       const v = Number(offsetsArr[i]);
-      if (Number.isFinite(v) && v >= 60 && v <= 180000) nums.push(v);
+      if (Number.isFinite(v) && v >= 10 && v <= 180000) nums.push(v);
     }
     if (!nums.length) return null;
     const sorted = nums.slice().sort((a, b) => a - b);
@@ -2319,10 +2338,10 @@
   function normalizeHistRecord(raw) {
     if (!raw || typeof raw !== 'object' || typeof raw.tag !== 'string' || !raw.tag) return null;
     const arrivalOffsetsMs = Array.isArray(raw.arrivalOffsetsMs)
-      ? raw.arrivalOffsetsMs.map(Number).filter((x) => Number.isFinite(x) && x >= 40 && x <= 180000).slice(-HIST_PRED_MAX_SAMPLES)
+      ? raw.arrivalOffsetsMs.map(Number).filter((x) => Number.isFinite(x) && x >= 10 && x <= 180000).slice(-HIST_PRED_MAX_SAMPLES)
       : [];
     const flightOffsetsMs = Array.isArray(raw.flightOffsetsMs)
-      ? raw.flightOffsetsMs.map(Number).filter((x) => Number.isFinite(x) && x >= 40 && x <= 180000).slice(-HIST_PRED_MAX_SAMPLES)
+      ? raw.flightOffsetsMs.map(Number).filter((x) => Number.isFinite(x) && x >= 10 && x <= 180000).slice(-HIST_PRED_MAX_SAMPLES)
       : [];
     const crashDeltasMs = Array.isArray(raw.crashDeltasMs)
       ? raw.crashDeltasMs.map(Number).filter((x) => Number.isFinite(x) && x >= 0 && x <= 180000).slice(-HIST_PRED_MAX_SAMPLES)
@@ -2459,8 +2478,8 @@
     if (!(firstM > 0)) return;
     const fromStartMs = (roundStartMono > 0 && firstM >= roundStartMono) ? Math.round(firstM - roundStartMono) : -1;
     const fromFlightMs = (flightStartMono > 0 && firstM >= flightStartMono) ? Math.round(firstM - flightStartMono) : -1;
-    const validStart = (fromStartMs >= 40 && fromStartMs <= 180000);
-    const validFlight = (fromFlightMs >= 40 && fromFlightMs <= 180000);
+    const validStart = (fromStartMs >= 10 && fromStartMs <= 180000);
+    const validFlight = (fromFlightMs >= 10 && fromFlightMs <= 180000);
     if (!validStart && !validFlight) return;
     const lastM = Number(h.lastMono || firstM);
     const dtToCrash = Math.max(0, Math.round(crashMonoMs - lastM));
@@ -2631,9 +2650,34 @@
 
   let lastPolledLiveBtn = null;
   let lastPollFallbackScanAt = 0;
+  let lastDomErrScanAt = 0;
+  let lastDomErrTextSig = '';
+  let lastDomErrSigAt = 0;
   function pollLiveButtonState(obsMono) {
     try {
       if (document.hidden) return;
+      if (lastClickRace && !lastClickRace.errText && lastClickRace.cashRel === 'NONE' && Date.now() - lastTriggerAt <= 6500) {
+        const nowErrScan = Date.now();
+        if (nowErrScan - lastDomErrScanAt >= 160) {
+          lastDomErrScanAt = nowErrScan;
+          const errNodes = document.querySelectorAll('[role="alert"],[class*="toast"],[class*="alert"],[class*="error"],[class*="modal"],[class*="banner"],[class*="notif"]');
+          for (let ei = 0; ei < errNodes.length; ei++) {
+            const en = errNodes[ei];
+            if (!en || isOwnHudNode(en)) continue;
+            const rawTxt = String(en.innerText || en.textContent || '').trim().replace(/\s+/g, ' ');
+            if (!rawTxt || rawTxt.length > 220) continue;
+            if (/(?:decision\s*not\s*processed|not\s*received\s*in\s*time|cashout\s*failed)/i.test(rawTxt)) {
+              const sig = rawTxt.slice(0, 80);
+              if (sig !== lastDomErrTextSig || nowErrScan - lastDomErrSigAt >= 2500) {
+                lastDomErrTextSig = sig;
+                lastDomErrSigAt = nowErrScan;
+                observeRacePacket('DOM-TAG', 'ERR', rawTxt, performance.now(), fmtTimeMs(new Date()), null);
+              }
+              break;
+            }
+          }
+        }
+      }
       if (isIframe && !iframeLocalTarget.active && hudHidden) return;
       const fx = (isIframe && iframeLocalTarget.active && hudHidden) ? iframeLocalTarget.x : targetX;
       const fy = (isIframe && iframeLocalTarget.active && hudHidden) ? iframeLocalTarget.y : targetY;
@@ -2680,7 +2724,7 @@
     if (!CFG.armed || document.hidden || isDraggingTarget) return;
     if (hudHidden && (!isIframe || !iframeLocalTarget.active)) return;
     pollLiveButtonState(performance.now());
-  }, 220);
+  }, 65);
 
   function normalizeAutoLeadRecord(raw) {
     if (!raw || typeof raw !== 'object' || typeof raw.tag !== 'string' || !raw.tag) return null;
@@ -2691,6 +2735,7 @@
           .map((s) => ({
             roundKey: String(s.roundKey),
             crashBeforeClickMs: Math.max(0, Number(s.crashBeforeClickMs) || 0),
+            crashGapMs: typeof s.crashGapMs === 'number' ? Number(s.crashGapMs) : ((Number(s.crashBeforeClickMs) || 0) > 0 ? -Number(s.crashBeforeClickMs) : 0),
             cashBeforeClickMs: Math.max(0, Number(s.cashBeforeClickMs) || 0),
             btnClosedBeforeClickMs: Math.max(0, Number(s.btnClosedBeforeClickMs) || 0),
             tagToClickMs: Math.max(0, Number(s.tagToClickMs) || 0),
@@ -2714,9 +2759,13 @@
       avgClickToCashMs: Math.max(0, Number(raw.avgClickToCashMs) || 0),
       serverAcceptMs: Math.max(0, Number(raw.serverAcceptMs) || 0),
       recommendedLeadMs: 0,
-      appliedMultiplier: (typeof raw.appliedMultiplier === 'number' && raw.appliedMultiplier >= 3 && raw.appliedMultiplier <= AUTO_LEAD_MAX_MULTIPLIER) ? raw.appliedMultiplier : 3,
+      appliedMultiplier: (typeof raw.appliedMultiplier === 'number' && raw.appliedMultiplier >= 1 && raw.appliedMultiplier <= AUTO_LEAD_MAX_MULTIPLIER) ? raw.appliedMultiplier : 3,
       appliedLeadMs: (typeof raw.appliedLeadMs === 'number' && raw.appliedLeadMs >= 0) ? Math.min(MAX_PRETRIG_LEAD_MS, Math.round(raw.appliedLeadMs)) : null,
       calibrated: false,
+      late400Streak: 0,
+      late400RuleActive: false,
+      late400BoostMs: 0,
+      lastCrashGapMs: 0,
       lastOutcome: String(raw.lastOutcome || ''),
       lastReason: String(raw.lastReason || ''),
       failureCause: String(raw.failureCause || ''),
@@ -2814,6 +2863,16 @@
         solution: isBn
           ? ('সমাধান: ট্যাগ→ক্লিক ও বাটন বন্ধের গ্যাপ ধরে Auto ' + mult + 'x (' + nextLead + 'ms লিড) সেট করা হয়েছে + Auto-Retry চালু আছে। Pre-Trig চালু রাখুন এবং Bet সক্রিয় থাকলে পরের রাউন্ডে আগেই ক্লিক হবে।')
           : ('Solution: Calibrated Auto ' + mult + 'x (' + nextLead + 'ms lead) before button cutoff. Keep Pre-Trig ON and active bet live.')
+      };
+    }
+    if (outcome === 'CUTOFF_MISS' || (outcome === 'CRASH_AFTER' && hasOutCash)) {
+      return {
+        cause: isBn
+          ? ('Cashout রিকোয়েস্ট গেছে কিন্তু Cash হয়নি (+' + crashAfterMs + 'ms পর Crash) — সার্ভার কাটঅফ মিস হয়েছে')
+          : ('Cashout request sent (+' + crashAfterMs + 'ms before Crash), but no CASH confirmed — server cutoff passed'),
+        solution: isBn
+          ? ('সমাধান: Auto ' + mult + 'x (' + nextLead + 'ms লিড) বাড়ানো হয়েছে যাতে পরের রাউন্ডে কাটঅফের আগেই ক্লিক পৌঁছায়।')
+          : ('Solution: Escalated Auto ' + mult + 'x (' + nextLead + 'ms lead) so next click reaches server before cutoff.')
       };
     }
     if (outcome === 'CRASH_AFTER' && !hasOutCash) {
@@ -2985,11 +3044,14 @@
   function computeMultLeadMs(rec, multVal) {
     const mult = normalizeMultPreset(multVal);
     const rttNow = Math.max(0, Number(typeof rollingServerRttMs === 'number' ? rollingServerRttMs : 0) || 0);
-    const humanCompMs = CFG.autoHumanClick !== false ? Math.round(autoHumanState.avgSpanMs || 38) : 0;
+    const humanCompMs = (CFG.zeroDelay && !CFG.humanTap) ? (Number(CFG.zeroDelayMicroMs) || 0) : Math.round(autoHumanState.avgSpanMs || 38.5);
+    const rttFloor = rttNow > 0 ? Math.round(rttNow) + 45 : 75;
     const base = rec
-      ? Math.max(rec.medianDeficitMs || 0, rec.serverAcceptMs || 0, rttNow, 60) + humanCompMs
-      : Math.max(90, rttNow + humanCompMs);
-    return Math.max(15, Math.min(MAX_PRETRIG_LEAD_MS, Math.round(base * (mult / 3) * 1.15)));
+      ? Math.max(rec.medianDeficitMs || 0, rec.serverAcceptMs || 0, rttFloor, 85) + humanCompMs
+      : Math.max(115, rttFloor + humanCompMs);
+    const scaled = Math.round(base * (mult / 3) * 1.15);
+    const monoFloor = Math.round(rttFloor + humanCompMs * 0.5 + (mult - 1) * 18);
+    return Math.max(15, Math.min(MAX_PRETRIG_LEAD_MS, Math.max(scaled, monoFloor)));
   }
 
   function setGlobalLeadConfig(mode, val) {
@@ -3078,12 +3140,32 @@
     for (let i = rec.samples.length - 1; i >= 0; i--) {
       const s = rec.samples[i];
       if (s.outcome === 'NO_BET_ACTIVE') continue;
-      if ((Number(s.effectiveDeficitMs) || 0) > 0 || s.outcome === 'CRASH_BEFORE' || s.outcome === 'CASH_BEFORE' || s.outcome === 'PRE_BTN_OFF' || s.outcome === 'TAG_AFTER_CRASH' || s.outcome === 'ERR_REJECT' || s.outcome === 'NO_CASHOUT_CLICK') {
+      if ((Number(s.effectiveDeficitMs) || 0) > 0 || s.outcome === 'CRASH_BEFORE' || s.outcome === 'CASH_BEFORE' || s.outcome === 'PRE_BTN_OFF' || s.outcome === 'TAG_AFTER_CRASH' || s.outcome === 'ERR_REJECT' || s.outcome === 'NO_CASHOUT_CLICK' || s.outcome === 'CUTOFF_MISS') {
         consecutiveFailAfterCal += 1;
       } else {
         break;
       }
     }
+    let late400Streak = 0;
+    for (let i = rec.samples.length - 1; i >= 0; i--) {
+      const s = rec.samples[i];
+      if (s.outcome === 'NO_BET_ACTIVE' || s.outcome === 'TAG_AFTER_CRASH') continue;
+      if ((Number(s.crashBeforeClickMs) || 0) >= LATE_400_THRESHOLD_MS) {
+        late400Streak += 1;
+      } else {
+        break;
+      }
+    }
+    rec.late400Streak = late400Streak;
+    rec.late400RuleActive = late400Streak >= AUTO_LEAD_MIN_ROUNDS;
+    rec.late400BoostMs = rec.late400RuleActive ? LATE_400_BOOST_MS : 0;
+    const latestSampForGap = rec.samples.length ? rec.samples[rec.samples.length - 1] : null;
+    rec.lastCrashGapMs = latestSampForGap
+      ? (typeof latestSampForGap.crashGapMs === 'number'
+          ? Math.round(latestSampForGap.crashGapMs)
+          : ((Number(latestSampForGap.crashBeforeClickMs) || 0) > 0 ? -Math.round(Number(latestSampForGap.crashBeforeClickMs)) : 0))
+      : 0;
+
     lateDefs.sort((a, b) => a - b);
     rec.lateCount = lateDefs.length;
     rec.okCount = okCnt;
@@ -3177,11 +3259,12 @@
       const lastSamp = rec.samples[rec.samples.length - 1];
       const prevApplied = rec.appliedLeadMs;
       const prevMult = (typeof rec.appliedMultiplier === 'number' && rec.appliedMultiplier >= 3) ? rec.appliedMultiplier : 3;
+      const basePrevLead = Math.max(Number(prevApplied) || 0, Math.round(Number(CFG.predictivePreTriggerLeadMs) || 0));
       if (lastSamp && lastSamp.effectiveDeficitMs > 0) {
-        if (consecutiveFailAfterCal >= 2 || (typeof prevApplied === 'number' && prevApplied > 0 && lastSamp.isPredClick)) {
-          multFactor = Math.min(AUTO_LEAD_MAX_MULTIPLIER, prevMult + 1 + (lastSamp.effectiveDeficitMs > 180 ? 1 : 0));
+        if (consecutiveFailAfterCal >= 2 || (basePrevLead > 0 && lastSamp.isPredClick) || lastSamp.outcome === 'CUTOFF_MISS' || lastSamp.outcome === 'ERR_REJECT') {
+          multFactor = Math.min(AUTO_LEAD_MAX_MULTIPLIER, Math.max(prevMult, 3) + 1 + (lastSamp.effectiveDeficitMs > 180 ? 1 : 0));
         } else {
-          multFactor = Math.min(AUTO_LEAD_MAX_MULTIPLIER, Math.max(prevMult, consecutiveFailAfterCal + 2));
+          multFactor = Math.min(AUTO_LEAD_MAX_MULTIPLIER, Math.max(prevMult, consecutiveFailAfterCal + 3));
         }
       } else {
         multFactor = Math.max(3, Math.min(AUTO_LEAD_MAX_MULTIPLIER, prevMult));
@@ -3189,27 +3272,34 @@
       if (med > serverAcceptBudget * 1.4 && multFactor < AUTO_LEAD_MAX_MULTIPLIER) {
         multFactor = Math.min(AUTO_LEAD_MAX_MULTIPLIER, Math.max(multFactor, Math.ceil((med + serverAcceptBudget) / Math.max(45, serverAcceptBudget * 0.45))));
       }
+      if (rec.late400RuleActive) {
+        multFactor = Math.min(AUTO_LEAD_MAX_MULTIPLIER, Math.max(LATE_400_MULTIPLIER, multFactor));
+      }
       rec.appliedMultiplier = multFactor;
-      const multLead = Math.max(60, Math.min(MAX_PRETRIG_LEAD_MS, Math.round(serverAcceptBudget * (multFactor / 3) * 1.2 + med * 0.65 + rttAllowance * 0.5)));
+      const multLead = Math.max(80, Math.min(MAX_PRETRIG_LEAD_MS, Math.round(serverAcceptBudget * (multFactor / 3) * 1.25 + med * 0.75 + rttAllowance * 0.5)));
       rec.recommendedLeadMs = multLead;
       rec.calibrated = true;
       let targetLead = multLead;
       if (
         lastSamp &&
-        typeof prevApplied === 'number' &&
-        prevApplied >= multLead &&
-        lastSamp.effectiveDeficitMs > 5
+        lastSamp.effectiveDeficitMs > 5 &&
+        basePrevLead >= multLead
       ) {
-        const deficitStep = Math.max(med, lastSamp.effectiveDeficitMs, 35) + Math.round(rttAllowance * 0.35) + Math.round(humanCompMs * 0.5);
-        targetLead = Math.min(MAX_PRETRIG_LEAD_MS, Math.round(prevApplied + deficitStep * Math.max(1, multFactor / 3)));
+        const deficitStep = Math.max(med, lastSamp.effectiveDeficitMs, 45) + Math.round(rttAllowance * 0.35) + Math.round(humanCompMs * 0.5);
+        targetLead = Math.min(MAX_PRETRIG_LEAD_MS, Math.round(basePrevLead + deficitStep * Math.max(1, multFactor / 3)));
       }
       rec.appliedLeadMs = targetLead;
       if (allowApply && CFG.autoLead3xEnabled !== false) {
         const shortTag = rec.tag.length > 22 ? (rec.tag.slice(0, 22) + '…') : rec.tag;
         const srvBadge = rec.serverAcceptMs > 0 ? (' · Srv ' + rec.serverAcceptMs + 'ms') : (' · RTT ' + Math.round(rttAllowance) + 'ms');
+        const lateBoostNote = rec.late400RuleActive
+          ? (CFG.lang === 'bn'
+              ? (' · 🔴🔵 -400ms(' + rec.late400Streak + 'R)→+' + rec.late400BoostMs + 'ms (800×6) বাতি')
+              : (' · 🔴🔵 -400ms(' + rec.late400Streak + 'R)→+' + rec.late400BoostMs + 'ms (800×6) Light'))
+          : '';
         lastAutoLeadStatusNote = (CFG.lang === 'bn'
-          ? ('⚡ Auto ' + multFactor + 'x [' + shortTag + ']: ' + rec.roundCount + 'R (-' + Math.round(med) + 'ms' + srvBadge + ') → ' + targetLead + 'ms আগে ক্লিক')
-          : ('⚡ Auto ' + multFactor + 'x [' + shortTag + ']: ' + rec.roundCount + 'R (-' + Math.round(med) + 'ms' + srvBadge + ') → ' + targetLead + 'ms lead'));
+          ? ('⚡ Auto ' + multFactor + 'x [' + shortTag + ']: ' + rec.roundCount + 'R (-' + Math.round(med) + 'ms' + srvBadge + ') → ' + targetLead + 'ms আগে ক্লিক' + lateBoostNote)
+          : ('⚡ Auto ' + multFactor + 'x [' + shortTag + ']: ' + rec.roundCount + 'R (-' + Math.round(med) + 'ms' + srvBadge + ') → ' + targetLead + 'ms lead' + lateBoostNote));
         rec.lastReason = lastAutoLeadStatusNote;
         const activeRules = parseTagList((typeof elTags !== 'undefined' && elTags && elTags.value) || CFG.tags || '');
         const isCurrentTag = !activeRules.length || activeRules.some((r) => r === rec.tag || rec.tag.indexOf(r) !== -1 || r.indexOf(rec.tag) !== -1);
@@ -3326,7 +3416,7 @@
   }
 
   function getEffectiveLeadMsForTag(tag, altRule) {
-    const fallbackLead = Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Number(CFG.predictivePreTriggerLeadMs != null ? CFG.predictivePreTriggerLeadMs : 100)));
+    const fallbackLead = Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Number(CFG.predictivePreTriggerLeadMs != null ? CFG.predictivePreTriggerLeadMs : 260)));
     const rec = getAutoLeadRecordForTag(tag, altRule);
     const ov = getTagLeadOverride(tag, altRule);
     if (ov) {
@@ -3371,8 +3461,8 @@
       const shortTag = rec.tag.length > 18 ? (rec.tag.slice(0, 18) + '…') : rec.tag;
       const defTxt = sampleObj.effectiveDeficitMs > 0 ? (' (-' + Math.round(sampleObj.effectiveDeficitMs) + 'ms)') : ' (OK)';
       lastAutoLeadStatusNote = (CFG.lang === 'bn'
-        ? ('⏳ Auto3x [' + shortTag + ']: ' + rec.roundCount + '/' + AUTO_LEAD_MIN_ROUNDS + 'R চেক' + defTxt)
-        : ('⏳ Auto3x [' + shortTag + ']: ' + rec.roundCount + '/' + AUTO_LEAD_MIN_ROUNDS + 'R' + defTxt));
+        ? ('⏳ Auto 10x [' + shortTag + ']: ' + rec.roundCount + '/' + AUTO_LEAD_MIN_ROUNDS + 'R চেক' + defTxt)
+        : ('⏳ Auto 10x [' + shortTag + ']: ' + rec.roundCount + '/' + AUTO_LEAD_MIN_ROUNDS + 'R' + defTxt));
       rec.lastReason = lastAutoLeadStatusNote;
     }
     saveTagAutoLeadData(true);
@@ -3462,6 +3552,9 @@
           appliedMultiplier: (rec && rec.appliedMultiplier) || 3,
           leadMs: (rec && rec.appliedLeadMs) || CFG.predictivePreTriggerLeadMs,
           appliedLeadMs: (rec && rec.appliedLeadMs) || CFG.predictivePreTriggerLeadMs,
+          late400Streak: (rec && rec.late400Streak) || 0,
+          late400RuleActive: Boolean(rec && rec.late400RuleActive),
+          late400BoostMs: (rec && rec.late400BoostMs) || 0,
           clickDelayMs: typeof (info && info.tagToClickMs) === 'number' ? info.tagToClickMs : undefined,
           cashDelayMs: typeof (info && info.clickToCashMs) === 'number' ? info.clickToCashMs : undefined,
           deltaMs: Math.max(0, Number((info && (info.crashBeforeClickMs || info.cashBeforeClickMs || info.btnClosedBeforeClickMs || info.tagAfterCrashMs)) || 0)),
@@ -3531,16 +3624,30 @@
     } else if (r.crashRel === 'CRASH_AFTER') {
       if (r.outRel === 'NONE') {
         outcome = 'NO_CASHOUT_CLICK';
-        effectiveDeficitMs = 35;
+        effectiveDeficitMs = Math.max(120, Math.round((Number(rollingServerRttMs) || 85) + 85));
       } else {
-        outcome = 'CRASH_AFTER';
-        effectiveDeficitMs = 0;
+        outcome = 'CUTOFF_MISS';
+        const rttEst = Math.max(85, Number(typeof rollingServerRttMs === 'number' ? rollingServerRttMs : 0) || 0);
+        const hcEst = CFG.autoHumanClick !== false ? Math.round(autoHumanState.avgSpanMs || 38) : 0;
+        effectiveDeficitMs = Math.max(180, Math.round(rttEst + hcEst + 140 + tagToClickMs));
       }
     } else {
       return null;
     }
 
-    const crashMono = outcome === 'CRASH_BEFORE' ? Math.max(0, r.monoMs - crashBeforeClickMs) : (curAutoRoundTiming.crashMono || 0);
+    if (r.crashRel === 'CRASH_BEFORE' && typeof r.crashDelta === 'number' && r.crashDelta > 0) {
+      crashBeforeClickMs = Math.max(crashBeforeClickMs, Number(r.crashDelta));
+    } else if (curAutoRoundTiming.crashMono > 0 && typeof r.monoMs === 'number' && r.monoMs > curAutoRoundTiming.crashMono) {
+      crashBeforeClickMs = Math.max(crashBeforeClickMs, Number((r.monoMs - curAutoRoundTiming.crashMono).toFixed(1)));
+    }
+    const crashGapMs = crashBeforeClickMs > 0
+      ? -Number(crashBeforeClickMs.toFixed(1))
+      : (r.crashRel === 'CRASH_AFTER' && typeof r.crashDelta === 'number' ? Number(Number(r.crashDelta).toFixed(1)) : 0);
+    if (crashBeforeClickMs >= LATE_400_THRESHOLD_MS) {
+      effectiveDeficitMs = Math.max(effectiveDeficitMs, crashBeforeClickMs + tagToClickMs);
+    }
+
+    const crashMono = crashBeforeClickMs > 0 ? Math.max(0, r.monoMs - crashBeforeClickMs) : (curAutoRoundTiming.crashMono || 0);
     if (tagArr && crashMono > 0 && tagArr.tagArrivedMono > crashMono) {
       tagAfterCrashMs = Math.max(0, tagArr.tagArrivedMono - crashMono);
       if (effectiveDeficitMs > 0) effectiveDeficitMs = Math.max(effectiveDeficitMs, tagAfterCrashMs + tagToClickMs);
@@ -3554,6 +3661,7 @@
     const rec = upsertAutoLeadRoundSample(tagKey, {
       roundKey,
       crashBeforeClickMs: Number(crashBeforeClickMs.toFixed(1)),
+      crashGapMs,
       cashBeforeClickMs: Number(cashBeforeClickMs.toFixed(1)),
       btnClosedBeforeClickMs: Number(btnClosedBeforeClickMs.toFixed(1)),
       tagToClickMs,
@@ -3569,6 +3677,9 @@
       const isBn = CFG.lang === 'bn';
       curAutoRoundTiming.verifiedRoundKeys.add(tagKey);
       if (outcome === 'CASH_AFTER') {
+        lastRoundMissStreak = 0;
+        lastRoundCutoffMissedAt = 0;
+        if (typeof syncTurboCfg === 'function') syncTurboCfg(false, false);
         try { recordHumanClickOutcome('CASH_AFTER', { tag: tagKey, humanSpanMs: r.humanSpanMs }); } catch {}
         rec.failureCause = '';
         rec.failureSolution = '';
@@ -3576,6 +3687,11 @@
         r.failureSolution = '';
         setAutoLeadVerifyOutcome(rec, 'DONE', isBn ? ('Done (' + (rec.appliedMultiplier || 3) + 'x · ' + (rec.appliedLeadMs || CFG.predictivePreTriggerLeadMs) + 'ms → Cash সফল +' + Number(r.cashDelta || 0).toFixed(0) + 'ms)') : ('Done (' + (rec.appliedMultiplier || 3) + 'x · ' + (rec.appliedLeadMs || CFG.predictivePreTriggerLeadMs) + 'ms → Cashed +' + Number(r.cashDelta || 0).toFixed(0) + 'ms)'));
       } else {
+        if (outcome === 'CUTOFF_MISS' || outcome === 'ERR_REJECT' || outcome === 'CRASH_BEFORE' || outcome === 'CASH_BEFORE' || outcome === 'PRE_BTN_OFF') {
+          lastRoundCutoffMissedAt = Date.now();
+          lastRoundMissStreak += 1;
+          if (typeof syncTurboCfg === 'function') syncTurboCfg(false, false);
+        }
         if (outcome === 'ERR_REJECT') {
           try {
             recordHumanClickOutcome('ERR_REJECT', { tag: tagKey, errText: r.errText || '' });
@@ -3716,6 +3832,43 @@
     curAutoRoundTiming.badPreClickReason = '';
   }
 
+  function computePreSignal2xWindow(baseLeadMs, extraBoostMs) {
+    const base = Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Math.round(Number(baseLeadMs) || 0)));
+    const boost = Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Math.round(Number(extraBoostMs) || 0)));
+    const totalHorizonMs = Math.min(MAX_PRETRIG_LEAD_MS, base * 2 + boost);
+    const advanceAheadMs = Math.max(0, totalHorizonMs - base);
+    return { baseLeadMs: base, extraBoostMs: boost, totalHorizonMs, advanceAheadMs };
+  }
+
+  function getActiveRgbLeadSnapshot(tagHint) {
+    const rules = parseTagList((typeof elTags !== 'undefined' && elTags && elTags.value) || CFG.tags || '');
+    const cleanHint = resolveAutoLeadTagKey(tagHint);
+    const rule = cleanHint || (rules.length ? rules[0] : '');
+    const leadMs = rule ? getEffectiveLeadMsForTag(rule) : Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Number(CFG.predictivePreTriggerLeadMs != null ? CFG.predictivePreTriggerLeadMs : 260)));
+    const ov = rule ? getTagLeadOverride(rule) : null;
+    const rec = rule ? getAutoLeadRecordForTag(rule) : null;
+    const gMode = normalizeLeadMode(CFG.globalLeadMode);
+    let mult = normalizeMultPreset(CFG.globalLeadMultiplier);
+    if (ov && ov.mode === 'manual_mult' && typeof ov.multiplier === 'number') {
+      mult = normalizeMultPreset(ov.multiplier);
+    } else if (gMode === 'auto' && rec && typeof rec.appliedMultiplier === 'number' && rec.appliedMultiplier >= 1) {
+      mult = normalizeMultPreset(rec.appliedMultiplier);
+    }
+    const extraBoostMs = (rec && rec.late400RuleActive) ? (Number(rec.late400BoostMs) || LATE_400_BOOST_MS) : 0;
+    const win2x = computePreSignal2xWindow(leadMs, extraBoostMs);
+    return {
+      tag: rule || cleanHint || 'ACTIVE',
+      mult,
+      leadMs: win2x.baseLeadMs,
+      baseLeadMs: win2x.baseLeadMs,
+      extraBoostMs: win2x.extraBoostMs,
+      late400RuleActive: Boolean(rec && rec.late400RuleActive),
+      late400Streak: rec ? (rec.late400Streak || 0) : 0,
+      totalHorizonMs: win2x.totalHorizonMs,
+      advanceMs: win2x.advanceAheadMs
+    };
+  }
+
   function cancelPredictivePreTrigger(reason) {
     if (preTriggerTimerId) {
       clearTimeout(preTriggerTimerId);
@@ -3723,6 +3876,25 @@
     }
     if (preTriggerSchedule) {
       preTriggerSchedule = null;
+    }
+    if (preSignalTimerId) {
+      clearTimeout(preSignalTimerId);
+      preSignalTimerId = 0;
+    }
+    if (preSignalSchedule) {
+      preSignalSchedule = null;
+    }
+    if (
+      reason !== 'REAL_TURBO_HIT' &&
+      reason !== 'REAL_TAG_HIT' &&
+      reason !== 'REAL_TURBO_REMOTE' &&
+      reason !== 'RESCHEDULE' &&
+      rgbBlinkActive &&
+      !rgbBlinkIsTest &&
+      rgbBlinkReason === 'PRE_SIG_2X' &&
+      typeof stopToolRedBlueLights === 'function'
+    ) {
+      stopToolRedBlueLights(reason || 'PRETRIG_CANCEL', false);
     }
   }
 
@@ -3779,7 +3951,15 @@
       if (!(anchorStartMono > 0) || anchorStartMono <= lastTagRoundEndMono) return;
 
       const leadMs = getEffectiveLeadMsForTag(rec.tag, matchedRule);
-      const fireOffsetMs = Math.max(25, Math.round(rec.predOffsetMs - leadMs));
+      const fastZeroMode = Boolean(CFG.zeroDelay && !CFG.humanTap);
+      const urgentModeNow = Boolean(lastRoundMissStreak > 0 && Date.now() - lastRoundCutoffMissedAt <= 60000);
+      const dispatchCompMs = fastZeroMode
+        ? ((Number(CFG.zeroDelayMicroMs) || 0) + 2)
+        : (urgentModeNow ? 6 : Math.round((autoHumanState.avgSpanMs || 38.5) + 4));
+      const fireOffsetMs = Math.max(10, Math.round(rec.predOffsetMs - leadMs - dispatchCompMs));
+      const extraBoostMs = (autoRec && autoRec.late400RuleActive) ? (Number(autoRec.late400BoostMs) || LATE_400_BOOST_MS) : 0;
+      const win2x = computePreSignal2xWindow(leadMs, extraBoostMs);
+      const snapMult = getActiveRgbLeadSnapshot(matchedRule).mult;
       const cand = {
         tag: rec.tag,
         matchedRule,
@@ -3787,7 +3967,15 @@
         anchorStartMono,
         predOffsetMs: rec.predOffsetMs,
         leadMs,
+        mult: snapMult,
+        dispatchCompMs,
+        urgentFast: urgentModeNow,
         fireOffsetMs,
+        extraBoostMs: win2x.extraBoostMs,
+        late400RuleActive: Boolean(autoRec && autoRec.late400RuleActive),
+        late400Streak: autoRec ? (autoRec.late400Streak || 0) : 0,
+        totalHorizonMs: win2x.totalHorizonMs,
+        advanceAheadMs: win2x.advanceAheadMs,
         jitterMs: rec.jitterMs,
         samples: rec.samples,
         confidence: conf
@@ -3947,7 +4135,7 @@
     const predLbl = 'PRED-' + Math.round(sched.leadMs) + 'ms[' + String(sched.tag || 'TAG') + ']';
     lastMatchPreview = 'PRE-' + Math.round(sched.leadMs) + 'ms';
     if (typeof recordTagMatchLed === 'function') recordTagMatchLed(String(sched.tag || ''), 'PRED-PRE', 'PRE');
-    fireTargetClick(predLbl, preTriggerFiredAtMono);
+    fireTargetClick(predLbl, preTriggerFiredAtMono, undefined, Boolean(sched.urgentFast));
 
     const badPreClick = Boolean(CFG.clickEnabled !== false && !(lastDomClickMeta && lastDomClickMeta.dryRun) && lastDomClickMeta && isButtonAlreadyEnded(lastDomClickMeta.preText, lastDomClickMeta.disabled));
     if (badPreClick) {
@@ -4016,6 +4204,8 @@
       }
       if (triggerCount > 0) triggerCount -= 1;
       preTriggerFiredThisRound = false;
+      preSignalFiredThisRound = false;
+      preSignalWindowInfo = null;
       lastTriggerAt = 0;
       if (CFG.roundOnce) {
         roundClickLocked = false;
@@ -4059,6 +4249,80 @@
     syncUI();
   }
 
+  function executePreSignal2x(expectedAnchorStartMono) {
+    preSignalTimerId = 0;
+    const sched = preSignalSchedule;
+    preSignalSchedule = null;
+    if (!sched || hudHidden || !CFG.armed || preSignalFiredThisRound || preTriggerFiredThisRound) return;
+    if (CFG.histTagPredEnabled === false || CFG.predictivePreTriggerEnabled === false || CFG.preSignal2xEnabled === false) return;
+    if (CFG.roundOnce && roundClickLocked) return;
+    const curAnchor = sched.anchorType === 'flight'
+      ? (currentFlightStartMono > lastTagRoundEndMono ? currentFlightStartMono : (currentRoundStartMono > lastTagRoundEndMono ? currentRoundStartMono : curAutoRoundTiming.btnLiveStartMono))
+      : (currentRoundStartMono > lastTagRoundEndMono ? currentRoundStartMono : (currentFlightStartMono > lastTagRoundEndMono ? currentFlightStartMono : curAutoRoundTiming.btnLiveStartMono));
+    if (!(curAnchor > 0) || curAnchor !== expectedAnchorStartMono || curAnchor <= lastTagRoundEndMono) return;
+    if (!parseTagList((typeof elTags !== 'undefined' && elTags && elTags.value) || CFG.tags || '').length) return;
+
+    preSignalFiredThisRound = true;
+    const schedMult = normalizeMultPreset(sched.mult || CFG.globalLeadMultiplier);
+    preSignalWindowInfo = {
+      mult: schedMult,
+      baseLeadMs: sched.baseLeadMs,
+      extraBoostMs: sched.extraBoostMs || 0,
+      late400RuleActive: Boolean(sched.late400RuleActive),
+      totalHorizonMs: sched.totalHorizonMs,
+      advanceAheadMs: sched.advanceAheadMs,
+      tag: sched.tag,
+      firedAtMono: performance.now()
+    };
+    if (typeof startToolRedBlueLights === 'function') {
+      startToolRedBlueLights('PRE_SIG_2X', false, false, {
+        mult: schedMult,
+        advanceMs: sched.advanceAheadMs,
+        totalHorizonMs: sched.totalHorizonMs,
+        baseLeadMs: sched.baseLeadMs,
+        extraBoostMs: sched.extraBoostMs || 0,
+        late400RuleActive: Boolean(sched.late400RuleActive),
+        tag: sched.tag
+      });
+    }
+    const tStr = fmtTimeMs(new Date());
+    const logItem = {
+      uid: FRAME_ID + ':sig2x:' + (++evSeq),
+      src: 'PRE-SIG-2X',
+      kind: 'SIG2X',
+      direction: 'IN',
+      reasons: sched.extraBoostMs > 0 ? ['+2x-tool-strobe', '-400ms-800x6'] : ['+2x-tool-strobe'],
+      inspectorMatched: false,
+      matched: false,
+      matchedTag: 'PRE_SIG_2X',
+      time: tStr,
+      monoMs: Number(performance.now().toFixed(2)),
+      text: JSON.stringify({
+        event: 'PRE_SIGNAL_2X',
+        tag: sched.tag,
+        baseLeadMs: sched.baseLeadMs,
+        extraBoostMs: sched.extraBoostMs || 0,
+        late400RuleActive: Boolean(sched.late400RuleActive),
+        totalHorizonMs: sched.totalHorizonMs,
+        advanceAheadMs: sched.advanceAheadMs
+      })
+    };
+    pushPreservedLogs(logItem);
+    wsLogs.unshift(logItem);
+    if (wsLogs.length > 200) wsLogs.length = 200;
+    if (typeof queueRelay === 'function') {
+      try { queueRelay(logItem); } catch {}
+    }
+    pushSecurityLog(
+      sched.extraBoostMs > 0 ? '+2x + 4800ms Tool Signal' : '+2x Tool Signal',
+      '-' + sched.advanceAheadMs + 'ms আগে (' + sched.totalHorizonMs + 'ms' + (sched.extraBoostMs > 0 ? ', 800×6' : '') + ')',
+      'sync',
+      tStr
+    );
+    scheduleRenderLogs();
+    syncUI();
+  }
+
   function maybeSchedulePredictivePreTrigger(monoMs) {
     if (hudHidden || !CFG.armed || CFG.histTagPredEnabled === false || CFG.predictivePreTriggerEnabled === false) return false;
     if (preTriggerFiredThisRound || pendingTargetRetryTimer) return false;
@@ -4066,18 +4330,73 @@
     if (Date.now() - lastTriggerAt < (Number(CFG.cooldownMs) || 0)) return false;
 
     const cand = selectBestPreTriggerCandidate();
-    if (!cand) return false;
+    if (!cand) {
+      if (!preSignalFiredThisRound && !preSignalTimerId && CFG.preSignal2xEnabled !== false) {
+        const activeAnchor = currentFlightStartMono > lastTagRoundEndMono
+          ? currentFlightStartMono
+          : (curAutoRoundTiming.btnLiveStartMono > lastTagRoundEndMono ? curAutoRoundTiming.btnLiveStartMono : 0);
+        if (activeAnchor > 0) {
+          const snap = getActiveRgbLeadSnapshot();
+          const hasRules = parseTagList((typeof elTags !== 'undefined' && elTags && elTags.value) || CFG.tags || '').length > 0;
+          if (hasRules || curAutoRoundTiming.btnWasLiveInRound) {
+            preSignalSchedule = {
+              tag: snap.tag,
+              mult: snap.mult,
+              anchorType: 'flight',
+              anchorStartMono: activeAnchor,
+              baseLeadMs: snap.baseLeadMs,
+              extraBoostMs: snap.extraBoostMs,
+              late400RuleActive: Boolean(snap.late400RuleActive),
+              late400Streak: snap.late400Streak || 0,
+              totalHorizonMs: snap.totalHorizonMs,
+              advanceAheadMs: Math.max(snap.advanceMs, snap.extraBoostMs || 0, snap.leadMs),
+              fireAtMono: activeAnchor
+            };
+            executePreSignal2x(activeAnchor);
+            return true;
+          }
+        }
+      }
+      return false;
+    }
     const elapsedFromAnchor = Math.max(0, monoMs - cand.anchorStartMono);
     const delayMs = cand.fireOffsetMs - elapsedFromAnchor;
-    if (delayMs < -120) return false;
+    if (delayMs < -450 || (curAutoRoundTiming.crashMono > 0 && curAutoRoundTiming.crashMono >= cand.anchorStartMono)) return false;
+    if (delayMs < 0) cand.urgentFast = true;
     const fireAtMono = cand.anchorStartMono + cand.fireOffsetMs;
-    if (
+    const win2x = computePreSignal2xWindow(cand.leadMs, cand.extraBoostMs || 0);
+    const preSigOffsetMs = Math.max(0, Math.round(cand.predOffsetMs - win2x.totalHorizonMs));
+    const preSigDelayMs = preSigOffsetMs - elapsedFromAnchor;
+    const shouldKeepPreTrigger = Boolean(
       preTriggerTimerId &&
       preTriggerSchedule &&
       preTriggerSchedule.tag === cand.tag &&
       preTriggerSchedule.anchorStartMono === cand.anchorStartMono &&
-      Math.abs(preTriggerSchedule.fireAtMono - fireAtMono) <= 15
-    ) {
+      Math.abs(preTriggerSchedule.fireAtMono - fireAtMono) <= 15 &&
+      (!preSignalSchedule || (preSignalSchedule.extraBoostMs || 0) === win2x.extraBoostMs)
+    );
+    if (shouldKeepPreTrigger) {
+      if (
+        !preSignalTimerId &&
+        !preSignalFiredThisRound &&
+        CFG.preSignal2xEnabled !== false
+      ) {
+        preSignalSchedule = {
+          tag: cand.tag,
+          mult: cand.mult || normalizeMultPreset(CFG.globalLeadMultiplier),
+          anchorType: cand.anchorType,
+          anchorStartMono: cand.anchorStartMono,
+          baseLeadMs: win2x.baseLeadMs,
+          extraBoostMs: win2x.extraBoostMs,
+          late400RuleActive: Boolean(cand.late400RuleActive),
+          late400Streak: cand.late400Streak || 0,
+          totalHorizonMs: win2x.totalHorizonMs,
+          advanceAheadMs: Math.max(win2x.advanceAheadMs, cand.leadMs),
+          fireAtMono: cand.anchorStartMono + preSigOffsetMs
+        };
+        if (preSigDelayMs <= 0) executePreSignal2x(cand.anchorStartMono);
+        else preSignalTimerId = setTimeout(() => executePreSignal2x(cand.anchorStartMono), Math.max(0, Math.round(preSigDelayMs)));
+      }
       return true;
     }
     cancelPredictivePreTrigger('RESCHEDULE');
@@ -4087,6 +4406,26 @@
       scheduledAtMono: monoMs
     });
     preTriggerTimerId = setTimeout(() => executePredictivePreTrigger(cand.anchorStartMono), waitMs);
+    if (
+      !preSignalFiredThisRound &&
+      CFG.preSignal2xEnabled !== false
+    ) {
+      preSignalSchedule = {
+        tag: cand.tag,
+        mult: cand.mult || normalizeMultPreset(CFG.globalLeadMultiplier),
+        anchorType: cand.anchorType,
+        anchorStartMono: cand.anchorStartMono,
+        baseLeadMs: win2x.baseLeadMs,
+        extraBoostMs: win2x.extraBoostMs,
+        late400RuleActive: Boolean(cand.late400RuleActive),
+        late400Streak: cand.late400Streak || 0,
+        totalHorizonMs: win2x.totalHorizonMs,
+        advanceAheadMs: Math.max(win2x.advanceAheadMs, cand.leadMs),
+        fireAtMono: cand.anchorStartMono + preSigOffsetMs
+      };
+      if (preSigDelayMs <= 0) executePreSignal2x(cand.anchorStartMono);
+      else preSignalTimerId = setTimeout(() => executePreSignal2x(cand.anchorStartMono), Math.max(0, Math.round(preSigDelayMs)));
+    }
     return true;
   }
 
@@ -4564,6 +4903,8 @@
   function finalizeRoundTagDiscovery(monoMs) {
     cancelPredictivePreTrigger('ROUND_END');
     preTriggerFiredThisRound = false;
+    preSignalFiredThisRound = false;
+    preSignalWindowInfo = null;
     lastTagRoundEndMono = monoMs;
     tagFlightSeenInRound = false;
     const snapRoundStartMono = currentRoundStartMono;
@@ -4652,6 +4993,8 @@
     if (monoNow - lastTagRoundEndMono < 600 && tagRoundCount > 0) return false;
     finalizeRoundTagDiscovery(monoNow);
     preTriggerFiredThisRound = false;
+    preSignalFiredThisRound = false;
+    preSignalWindowInfo = null;
     if (CFG.armed && CFG.roundOnce && roundClickLocked) {
       roundClickLocked = false;
       roundSawFlightAfterLock = false;
@@ -5718,14 +6061,17 @@
   const hudContainer = hudShadow || root;
   let rgbHaloEl = null;
   let rgbStyleEl = null;
+  let toolRbStyleEl = null;
   let rgbBlinkActive = false;
   let rgbBlinkEl = null;
   let rgbBlinkStartedAt = 0;
   let rgbBlinkSafetyTimer = 0;
   let rgbBlinkFollowTimer = 0;
   let rgbBlinkIsTest = false;
-  let rgbBlinkColorIdx = 0;
-  const RGB_BLINK_COLORS = ['#ff0040', '#ff9900', '#facc15', '#00ff66', '#00e5ff', '#7b2cff', '#ff00cc'];
+  let rgbBlinkReason = '';
+  let rgbBlinkMeta = null;
+  let rgbPulseTimer = 0;
+  let rgbPulsePhase = 0;
 
   function isOwnHudNode(n) {
     if (!n) return false;
@@ -5733,7 +6079,7 @@
     if (rgbHaloEl && (n === rgbHaloEl || (rgbHaloEl.contains && rgbHaloEl.contains(n)))) return true;
     if (rgbStyleEl && n === rgbStyleEl) return true;
     try {
-      if (n.id === '__tt_rgb_led_halo' || n.id === '__tt_rgb_blink_style') return true;
+      if (n.id === '__tt_rgb_led_halo' || n.id === '__tt_rgb_blink_style' || n.id === '__tt_tool_rb_style') return true;
       if (n.getAttribute && n.getAttribute('data-tt-hud') === '1') return true;
       if (n.closest && n.closest('[data-tt-hud="1"], #__tt_rgb_led_halo')) return true;
     } catch {}
@@ -5742,145 +6088,192 @@
     return false;
   }
 
+  function ensureToolRedBlueStyle() {
+    try {
+      if (toolRbStyleEl && toolRbStyleEl.isConnected) return;
+      toolRbStyleEl = document.createElement('style');
+      toolRbStyleEl.id = '__tt_tool_rb_style';
+      toolRbStyleEl.textContent = [
+        '@keyframes ttToolRbBorder {',
+        '  0%, 49% { border-color: #ff1744 !important; box-shadow: 0 0 18px rgba(255,23,68,0.82), 0 0 34px rgba(255,23,68,0.38), 0 16px 40px rgba(0,0,0,0.65) !important; }',
+        '  50%, 100% { border-color: #00b0ff !important; box-shadow: 0 0 18px rgba(0,176,255,0.82), 0 0 34px rgba(0,176,255,0.38), 0 16px 40px rgba(0,0,0,0.65) !important; }',
+        '}',
+        '@keyframes ttToolRbLampRed {',
+        '  0%, 49% { opacity: 1; background: #ff1744; box-shadow: 0 0 12px #ff1744, 0 0 22px rgba(255,23,68,0.9); transform: scale(1.12); }',
+        '  50%, 100% { opacity: 0.2; background: #4c0519; box-shadow: none; transform: scale(0.88); }',
+        '}',
+        '@keyframes ttToolRbLampBlue {',
+        '  0%, 49% { opacity: 0.2; background: #0c2440; box-shadow: none; transform: scale(0.88); }',
+        '  50%, 100% { opacity: 1; background: #00b0ff; box-shadow: 0 0 12px #00b0ff, 0 0 22px rgba(0,176,255,0.9); transform: scale(1.12); }',
+        '}',
+        '.tt-tool-rb-panel-active {',
+        '  animation: ttToolRbBorder 0.38s steps(1, end) infinite !important;',
+        '}',
+        '.tt-tool-rb-red-strip {',
+        '  animation: ttToolRbLampRed 0.38s steps(1, end) infinite !important;',
+        '}',
+        '.tt-tool-rb-blue-strip {',
+        '  animation: ttToolRbLampBlue 0.38s steps(1, end) infinite !important;',
+        '}'
+      ].join('\n');
+      if (hudContainer && typeof hudContainer.appendChild === 'function') {
+        hudContainer.appendChild(toolRbStyleEl);
+      }
+    } catch {}
+  }
+
   function ensureRgbBlinkStyleAndHalo() {
+    // Button blinking intentionally removed: Red & Blue strobe lights belong exclusively on the TriggerTap Tool.
+    ensureToolRedBlueStyle();
+    return null;
+  }
+
+  function updateRgbHaloPosition() {
+    if (rgbHaloEl) {
+      try { rgbHaloEl.style.display = 'none'; } catch {}
+    }
+  }
+
+  function updateToolRedBlueVisuals() {
     try {
-      const targetDoc = (rgbBlinkEl && rgbBlinkEl.ownerDocument) || document;
-      if (!rgbStyleEl || !rgbStyleEl.isConnected) {
-        const existingSt = targetDoc.getElementById('__tt_rgb_blink_style');
-        if (existingSt) {
-          rgbStyleEl = existingSt;
+      ensureToolRedBlueStyle();
+      const on = Boolean(rgbBlinkActive);
+      const redLit = on && (rgbPulsePhase % 2 === 0);
+      if (typeof panel !== 'undefined' && panel) {
+        if (on) {
+          panel.classList.add('tt-tool-rb-panel-active');
+          panel.style.borderColor = redLit ? '#ff1744' : '#00b0ff';
+          panel.style.boxShadow = redLit
+            ? '0 0 18px rgba(255,23,68,0.82), 0 0 34px rgba(255,23,68,0.38), 0 16px 40px rgba(0,0,0,0.65)'
+            : '0 0 18px rgba(0,176,255,0.82), 0 0 34px rgba(0,176,255,0.38), 0 16px 40px rgba(0,0,0,0.65)';
         } else {
-          rgbStyleEl = targetDoc.createElement('style');
-          rgbStyleEl.id = '__tt_rgb_blink_style';
-          rgbStyleEl.setAttribute('data-tt-hud', '1');
-          rgbStyleEl.textContent = [
-            '@keyframes ttUserRgbBlink {',
-            '  0%   { box-shadow: 0 0 18px 4px #ff0040, 0 0 42px 8px rgba(255,0,64,0.88), inset 0 0 16px rgba(255,0,64,0.68); outline: 3px solid #ff0040; outline-offset: 2px; }',
-            '  16%  { box-shadow: 0 0 20px 5px #ff9900, 0 0 46px 9px rgba(255,153,0,0.92), inset 0 0 18px rgba(255,153,0,0.72); outline: 3px solid #ff9900; outline-offset: 2px; }',
-            '  33%  { box-shadow: 0 0 22px 5px #facc15, 0 0 48px 10px rgba(250,204,21,0.94), inset 0 0 18px rgba(250,204,21,0.75); outline: 3px solid #facc15; outline-offset: 2px; }',
-            '  50%  { box-shadow: 0 0 22px 5px #00ff66, 0 0 48px 10px rgba(0,255,102,0.95), inset 0 0 18px rgba(0,255,102,0.76); outline: 3px solid #00ff66; outline-offset: 2px; }',
-            '  66%  { box-shadow: 0 0 22px 5px #00e5ff, 0 0 48px 10px rgba(0,229,255,0.95), inset 0 0 18px rgba(0,229,255,0.75); outline: 3px solid #00e5ff; outline-offset: 2px; }',
-            '  83%  { box-shadow: 0 0 20px 5px #a855f7, 0 0 46px 9px rgba(168,85,247,0.92), inset 0 0 18px rgba(255,0,204,0.72); outline: 3px solid #ff00cc; outline-offset: 2px; }',
-            '  100% { box-shadow: 0 0 18px 4px #ff0040, 0 0 42px 8px rgba(255,0,64,0.88), inset 0 0 16px rgba(255,0,64,0.68); outline: 3px solid #ff0040; outline-offset: 2px; }',
-            '}',
-            '.tt-rgb-led-target {',
-            '  filter: brightness(1.68) saturate(2.25) contrast(1.16) !important;',
-            '  animation: ttUserRgbBlink 0.28s linear infinite !important;',
-            '  transition: none !important;',
-            '}'
-          ].join('\n');
-          const hostHead = targetDoc.head || targetDoc.documentElement;
-          if (hostHead && typeof hostHead.appendChild === 'function') hostHead.appendChild(rgbStyleEl);
+          panel.classList.remove('tt-tool-rb-panel-active');
+          panel.style.borderColor = 'rgba(255,255,255,0.15)';
+          panel.style.boxShadow = '0 16px 40px rgba(0,0,0,0.65)';
         }
       }
-      if (!rgbHaloEl || !rgbHaloEl.isConnected) {
-        const existingHalo = targetDoc.getElementById('__tt_rgb_led_halo');
-        if (existingHalo) {
-          rgbHaloEl = existingHalo;
+      if (typeof elToolRedStrip !== 'undefined' && elToolRedStrip) {
+        elToolRedStrip.style.display = on ? 'block' : 'none';
+        elToolRedStrip.style.opacity = on ? (redLit ? '1' : '0.22') : '0';
+        if (on) elToolRedStrip.classList.add('tt-tool-rb-red-strip');
+        else elToolRedStrip.classList.remove('tt-tool-rb-red-strip');
+      }
+      if (typeof elToolBlueStrip !== 'undefined' && elToolBlueStrip) {
+        elToolBlueStrip.style.display = on ? 'block' : 'none';
+        elToolBlueStrip.style.opacity = on ? (redLit ? '0.22' : '1') : '0';
+        if (on) elToolBlueStrip.classList.add('tt-tool-rb-blue-strip');
+        else elToolBlueStrip.classList.remove('tt-tool-rb-blue-strip');
+      }
+      if (typeof elToolTopStrip !== 'undefined' && elToolTopStrip) {
+        elToolTopStrip.style.display = on ? 'block' : 'none';
+        elToolTopStrip.style.opacity = on ? (redLit ? '1' : '0.22') : '0';
+        if (on) elToolTopStrip.classList.add('tt-tool-rb-red-strip');
+        else elToolTopStrip.classList.remove('tt-tool-rb-red-strip');
+      }
+      if (typeof elToolBottomStrip !== 'undefined' && elToolBottomStrip) {
+        elToolBottomStrip.style.display = on ? 'block' : 'none';
+        elToolBottomStrip.style.opacity = on ? (redLit ? '0.22' : '1') : '0';
+        if (on) elToolBottomStrip.classList.add('tt-tool-rb-blue-strip');
+        else elToolBottomStrip.classList.remove('tt-tool-rb-blue-strip');
+      }
+      if (typeof elHdrTitle !== 'undefined' && elHdrTitle) {
+        elHdrTitle.textContent = (on && (typeof minimized !== 'undefined' && minimized)) ? 'TriggerTap' : 'TriggerTap v5.2.5';
+      }
+      if (typeof elHdrRbWrap !== 'undefined' && elHdrRbWrap) {
+        elHdrRbWrap.style.display = on ? 'inline-flex' : 'none';
+      }
+      if (typeof elHdrRbRed !== 'undefined' && elHdrRbRed) {
+        elHdrRbRed.style.opacity = on ? (redLit ? '1' : '0.22') : '0';
+        if (on) elHdrRbRed.classList.add('tt-tool-rb-red-strip');
+        else elHdrRbRed.classList.remove('tt-tool-rb-red-strip');
+      }
+      if (typeof elHdrRbBlue !== 'undefined' && elHdrRbBlue) {
+        elHdrRbBlue.style.opacity = on ? (redLit ? '0.22' : '1') : '0';
+        if (on) elHdrRbBlue.classList.add('tt-tool-rb-blue-strip');
+        else elHdrRbBlue.classList.remove('tt-tool-rb-blue-strip');
+      }
+      if (typeof elHdrRbBadge !== 'undefined' && elHdrRbBadge) {
+        if (on && rgbBlinkMeta) {
+          const mTxt = rgbBlinkMeta.mult ? (rgbBlinkMeta.mult + 'x ') : '';
+          const aTxt = rgbBlinkMeta.advanceMs > 0 ? ('-' + Math.round(rgbBlinkMeta.advanceMs) + 'ms') : 'R/B';
+          const bTxt = rgbBlinkMeta.extraBoostMs > 0 ? ' +4.8s' : '';
+          elHdrRbBadge.textContent = mTxt + aTxt + bTxt;
         } else {
-          rgbHaloEl = targetDoc.createElement('div');
-          rgbHaloEl.id = '__tt_rgb_led_halo';
-          rgbHaloEl.setAttribute('data-tt-hud', '1');
-          rgbHaloEl.style.cssText = 'position:fixed;display:none;pointer-events:none;z-index:2147483645;border-radius:10px;border:3px solid #ff0040;box-sizing:border-box;mix-blend-mode:screen;filter:brightness(1.7) saturate(2.3);animation:ttUserRgbBlink 0.28s linear infinite;';
-          const hostBody = targetDoc.body || targetDoc.documentElement;
-          if (hostBody && typeof hostBody.appendChild === 'function') hostBody.appendChild(rgbHaloEl);
+          elHdrRbBadge.textContent = on ? 'R/B' : '';
         }
       }
     } catch {}
   }
 
-  function updateRgbHaloPosition(fallbackX, fallbackY) {
-    if (!rgbHaloEl) return;
+  function startToolRedBlueLights(reason, isTest, fromSync, meta) {
     try {
-      if (rgbBlinkEl && rgbBlinkEl.isConnected && typeof rgbBlinkEl.getBoundingClientRect === 'function') {
-        const r = rgbBlinkEl.getBoundingClientRect();
-        if (r && r.width > 4 && r.height > 4) {
-          rgbHaloEl.style.left = Math.round(r.left - 3) + 'px';
-          rgbHaloEl.style.top = Math.round(r.top - 3) + 'px';
-          rgbHaloEl.style.width = Math.round(r.width + 6) + 'px';
-          rgbHaloEl.style.height = Math.round(r.height + 6) + 'px';
-          rgbHaloEl.style.borderRadius = '10px';
-          rgbHaloEl.style.display = 'block';
-          return;
-        }
-      }
-      if (typeof fallbackX === 'number' && typeof fallbackY === 'number' && fallbackX > 0 && fallbackY > 0) {
-        rgbHaloEl.style.left = Math.round(fallbackX - 28) + 'px';
-        rgbHaloEl.style.top = Math.round(fallbackY - 22) + 'px';
-        rgbHaloEl.style.width = '56px';
-        rgbHaloEl.style.height = '44px';
-        rgbHaloEl.style.borderRadius = '12px';
-        rgbHaloEl.style.display = 'block';
-      }
-    } catch {}
-  }
-
-  function startTargetRgbBlink(el, x, y, reason, isTest, fromSync) {
-    try {
-      stopTargetRgbBlink('RESTART', true);
+      const prevMeta = (!isTest && reason !== 'TEST' && rgbBlinkActive && !rgbBlinkIsTest && rgbBlinkMeta)
+        ? Object.assign({}, rgbBlinkMeta)
+        : null;
+      stopToolRedBlueLights('RESTART', true);
       rgbBlinkActive = true;
       rgbBlinkStartedAt = performance.now();
       rgbBlinkIsTest = Boolean(isTest || reason === 'TEST');
-      let targetEl = (el && el.nodeType === 1 && !isOwnHudNode(el)) ? el : null;
-      if (!targetEl && typeof x === 'number' && typeof y === 'number') {
-        targetEl = (typeof deepElementFromPoint === 'function' ? deepElementFromPoint(document, x, y, false) : null)
-          || (typeof findFallbackBtnOuter === 'function' ? findFallbackBtnOuter(document, x, y) : null);
-      }
-      if (!targetEl && anchor && anchor.el && anchor.el.isConnected && !isOwnHudNode(anchor.el)) {
-        targetEl = anchor.el;
-      }
-      rgbBlinkEl = targetEl;
-      ensureRgbBlinkStyleAndHalo();
-      if (rgbBlinkEl && rgbBlinkEl.classList) {
-        try { rgbBlinkEl.classList.add('tt-rgb-led-target'); } catch {}
-      }
-      if (crosshair) {
-        try { crosshair.style.boxShadow = '0 0 18px 3px #00ff66, 0 0 32px rgba(0,229,255,0.85)'; } catch {}
-      }
-      updateRgbHaloPosition(x, y);
-      if (rgbBlinkFollowTimer) clearInterval(rgbBlinkFollowTimer);
-      rgbBlinkFollowTimer = setInterval(() => {
-        if (!rgbBlinkActive) return;
-        rgbBlinkColorIdx = (rgbBlinkColorIdx + 1) % RGB_BLINK_COLORS.length;
-        if (rgbHaloEl) {
-          const c = RGB_BLINK_COLORS[rgbBlinkColorIdx];
-          rgbHaloEl.style.borderColor = c;
-          rgbHaloEl.style.boxShadow = '0 0 22px 5px ' + c + ', 0 0 46px 10px ' + c;
+      rgbBlinkReason = String(reason || 'SIGNAL');
+      rgbBlinkMeta = meta && typeof meta === 'object'
+        ? Object.assign({}, prevMeta || {}, meta)
+        : prevMeta;
+      rgbBlinkEl = null;
+      rgbPulsePhase = 0;
+      if (rgbPulseTimer) { clearInterval(rgbPulseTimer); rgbPulseTimer = 0; }
+      rgbPulseTimer = setInterval(() => {
+        if (!rgbBlinkActive) {
+          clearInterval(rgbPulseTimer);
+          rgbPulseTimer = 0;
+          return;
         }
-        updateRgbHaloPosition(x, y);
-      }, 65);
+        rgbPulsePhase += 1;
+        updateToolRedBlueVisuals();
+      }, 180);
+      updateToolRedBlueVisuals();
       if (rgbBlinkSafetyTimer) clearTimeout(rgbBlinkSafetyTimer);
       rgbBlinkSafetyTimer = setTimeout(() => {
-        stopTargetRgbBlink('SAFETY_TIMEOUT', false);
+        stopToolRedBlueLights('SAFETY_TIMEOUT', false);
       }, rgbBlinkIsTest ? 4500 : 28000);
       if (!fromSync) {
         try {
-          if (isIframe) sendToTop({ __TT_SNIFFER__: true, kind: 'RGB_BLINK_START', reason: String(reason || 'CLICK'), x: x, y: y, isTest: rgbBlinkIsTest });
-          else broadcastDownToIframes({ __TT_SNIFFER__: true, kind: 'RGB_BLINK_START', reason: String(reason || 'CLICK'), x: x, y: y, isTest: rgbBlinkIsTest });
+          if (isIframe) sendToTop({ __TT_SNIFFER__: true, kind: 'RGB_BLINK_START', reason: rgbBlinkReason, isTest: rgbBlinkIsTest, meta: rgbBlinkMeta });
+          else broadcastDownToIframes({ __TT_SNIFFER__: true, kind: 'RGB_BLINK_START', reason: rgbBlinkReason, isTest: rgbBlinkIsTest, meta: rgbBlinkMeta });
         } catch {}
       }
       if (!fromSync && typeof queueRelay === 'function') {
         try {
           queueRelay({
-            uid: FRAME_ID + ':rgb:' + (++evSeq),
+            uid: FRAME_ID + ':rb:' + (++evSeq),
             src: 'VM-BRIDGE',
             kind: 'RGB',
             matched: false,
-            matchedTag: 'RGB_LED_START',
+            matchedTag: 'TOOL_RB_START',
             time: fmtTimeMs(new Date()),
             monoMs: Number(rgbBlinkStartedAt.toFixed(2)),
-            text: JSON.stringify({ event: 'RGB_BLINK_START', reason: String(reason || 'CLICK'), clickEnabled: CFG.clickEnabled !== false })
+            text: JSON.stringify({
+              event: 'TOOL_RB_START',
+              reason: rgbBlinkReason,
+              clickEnabled: CFG.clickEnabled !== false,
+              mult: rgbBlinkMeta && rgbBlinkMeta.mult ? rgbBlinkMeta.mult : undefined,
+              advanceMs: rgbBlinkMeta && rgbBlinkMeta.advanceMs ? rgbBlinkMeta.advanceMs : undefined,
+              extraBoostMs: rgbBlinkMeta && rgbBlinkMeta.extraBoostMs ? rgbBlinkMeta.extraBoostMs : undefined,
+              totalHorizonMs: rgbBlinkMeta && rgbBlinkMeta.totalHorizonMs ? rgbBlinkMeta.totalHorizonMs : undefined
+            })
           });
         } catch {}
       }
     } catch {}
   }
 
-  function stopTargetRgbBlink(reason, suppressSync) {
+  function stopToolRedBlueLights(reason, suppressSync) {
     const wasActive = rgbBlinkActive;
     try {
       rgbBlinkActive = false;
       rgbBlinkIsTest = false;
+      rgbBlinkReason = '';
+      rgbBlinkMeta = null;
+      if (rgbPulseTimer) { clearInterval(rgbPulseTimer); rgbPulseTimer = 0; }
       if (rgbBlinkSafetyTimer) { clearTimeout(rgbBlinkSafetyTimer); rgbBlinkSafetyTimer = 0; }
       if (rgbBlinkFollowTimer) { clearInterval(rgbBlinkFollowTimer); rgbBlinkFollowTimer = 0; }
       if (rgbBlinkEl && rgbBlinkEl.classList) {
@@ -5888,9 +6281,7 @@
       }
       rgbBlinkEl = null;
       if (rgbHaloEl) rgbHaloEl.style.display = 'none';
-      if (crosshair) {
-        try { crosshair.style.boxShadow = '0 0 0 2px rgba(0,0,0,0.55),0 6px 20px rgba(0,0,0,0.45)'; } catch {}
-      }
+      updateToolRedBlueVisuals();
       if (wasActive && !suppressSync) {
         try {
           if (isIframe) sendToTop({ __TT_SNIFFER__: true, kind: 'RGB_BLINK_STOP', reason: String(reason || 'STOP') });
@@ -5899,20 +6290,28 @@
         if (typeof queueRelay === 'function') {
           try {
             queueRelay({
-              uid: FRAME_ID + ':rgb:' + (++evSeq),
+              uid: FRAME_ID + ':rb:' + (++evSeq),
               src: 'VM-BRIDGE',
               kind: 'RGB',
               matched: false,
-              matchedTag: 'RGB_LED_STOP',
+              matchedTag: 'TOOL_RB_STOP',
               time: fmtTimeMs(new Date()),
               monoMs: Number(performance.now().toFixed(2)),
-              text: JSON.stringify({ event: 'RGB_BLINK_STOP', reason: String(reason || 'STOP') })
+              text: JSON.stringify({ event: 'TOOL_RB_STOP', reason: String(reason || 'STOP') })
             });
           } catch {}
         }
       }
     } catch {}
     return wasActive;
+  }
+
+  function startTargetRgbBlink(_el, _x, _y, reason, isTest, fromSync, meta) {
+    return startToolRedBlueLights(reason || 'CLICK', isTest, fromSync, meta);
+  }
+
+  function stopTargetRgbBlink(reason, suppressSync) {
+    return stopToolRedBlueLights(reason || 'STOP', suppressSync);
   }
 
   function setClickEnabledState(enabled, broadcast) {
@@ -6008,9 +6407,35 @@
     'font-size:12px'
   ].join(';');
 
+  const elToolRedStrip = mkEl('div', 'display:none;position:absolute;left:0;top:0;bottom:0;width:6px;z-index:5;pointer-events:none;background:#ff1744;');
+  elToolRedStrip.id = '__tt_tool_red_strip';
+  const elToolBlueStrip = mkEl('div', 'display:none;position:absolute;right:0;top:0;bottom:0;width:6px;z-index:5;pointer-events:none;background:#00b0ff;');
+  elToolBlueStrip.id = '__tt_tool_blue_strip';
+  const elToolTopStrip = mkEl('div', 'display:none;position:absolute;left:0;right:0;top:0;height:4px;z-index:6;pointer-events:none;background:#ff1744;');
+  elToolTopStrip.id = '__tt_tool_top_strip';
+  const elToolBottomStrip = mkEl('div', 'display:none;position:absolute;left:0;right:0;bottom:0;height:4px;z-index:6;pointer-events:none;background:#00b0ff;');
+  elToolBottomStrip.id = '__tt_tool_bottom_strip';
+  panel.appendChild(elToolRedStrip);
+  panel.appendChild(elToolBlueStrip);
+  panel.appendChild(elToolTopStrip);
+  panel.appendChild(elToolBottomStrip);
+
   const elHdr = mkEl('div', 'flex-shrink:0;display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:rgba(255,255,255,0.04);border-bottom:1px solid rgba(255,255,255,0.08);cursor:move;touch-action:none;user-select:none;gap:4px;');
   elHdr.id = '__tt_hdr';
-  elHdr.appendChild(mkEl('span', 'font-weight:700;letter-spacing:0.2px;color:#fff;font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;', 'TriggerTap v5.2+PreTrig'));
+  const hdrLeft = mkEl('div', 'display:flex;align-items:center;gap:5px;min-width:0;');
+  const elHdrRbWrap = mkEl('span', 'display:none;align-items:center;gap:3px;padding:1px 5px;border-radius:9999px;background:rgba(15,23,42,0.92);border:1px solid rgba(255,255,255,0.22);flex-shrink:0;');
+  elHdrRbWrap.id = '__tt_hdr_rb_wrap';
+  const elHdrRbRed = mkEl('span', 'display:inline-block;width:8px;height:8px;border-radius:9999px;background:#ff1744;');
+  const elHdrRbBlue = mkEl('span', 'display:inline-block;width:8px;height:8px;border-radius:9999px;background:#00b0ff;');
+  const elHdrRbBadge = mkEl('span', 'font-family:monospace;font-size:9px;font-weight:800;color:#fde68a;white-space:nowrap;', '');
+  elHdrRbWrap.appendChild(elHdrRbRed);
+  elHdrRbWrap.appendChild(elHdrRbBlue);
+  elHdrRbWrap.appendChild(elHdrRbBadge);
+  const elHdrTitle = mkEl('span', 'font-weight:700;letter-spacing:0.2px;color:#fff;font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;', 'TriggerTap v5.2.5');
+  elHdrTitle.id = '__tt_hdr_title';
+  hdrLeft.appendChild(elHdrRbWrap);
+  hdrLeft.appendChild(elHdrTitle);
+  elHdr.appendChild(hdrLeft);
 
   const hdrRight = mkEl('div', 'display:flex;align-items:center;gap:4px;flex-shrink:0;');
   const elPerf = mkEl('span', 'font-family:monospace;font-size:10.5px;color:#94a3b8;', '0.00ms');
@@ -6060,23 +6485,29 @@
   elPreTrigQuickLead.step = '5';
   elPreTrigQuickLead.title = 'predictiveLeadTimeMs (ms)';
   const elPreTrigMsLbl = mkEl('span', 'font-family:monospace;font-size:9.5px;color:#94a3b8;', 'ms');
-  const elTopAuto3xChip = mkEl('button', 'background:#065f46;color:#d1fae5;border:1px solid rgba(16,185,129,0.5);border-radius:6px;padding:3px 6px;font-size:9.5px;font-weight:700;cursor:pointer;touch-action:manipulation;white-space:nowrap;', '⚡ 3x Auto: ON');
+  const elTopAuto3xChip = mkEl('button', 'background:#065f46;color:#d1fae5;border:1px solid rgba(16,185,129,0.5);border-radius:6px;padding:3px 6px;font-size:9.5px;font-weight:700;cursor:pointer;touch-action:manipulation;white-space:nowrap;', '⚡ Auto 10x: ON');
   elTopAuto3xChip.id = '__tt_top_auto3x_chip';
   elTopAuto3xChip.type = 'button';
-  elTopAuto3xChip.title = CFG.lang === 'bn' ? '৪-৫ রাউন্ড চেক করে ট্যাগ অনুযায়ী অটো 3x ms সেট (চালু/বন্ধ)' : 'Check 4-5 rounds per tag and auto-set 3x Lead ms';
+  elTopAuto3xChip.title = CFG.lang === 'bn' ? 'সার্ভার স্পিড বুঝে 1x–10x অটো লিড সেট (চালু/বন্ধ)' : 'Auto-scale 1x–10x lead ms per tag';
+  const elTopPreSig2xChip = mkEl('button', 'background:#1e1b4b;color:#fde68a;border:1px solid rgba(255,23,68,0.5);border-radius:6px;padding:3px 6px;font-size:9.5px;font-weight:700;cursor:pointer;touch-action:manipulation;white-space:nowrap;', '🔴🔵 +2x: ON');
+  elTopPreSig2xChip.id = '__tt_top_presig2x_chip';
+  elTopPreSig2xChip.type = 'button';
+  elTopPreSig2xChip.title = CFG.lang === 'bn' ? 'Auto x-এর ২x আগে (+2x) টুলে লাল-নীল সিগনাল বাতি (চালু/বন্ধ)' : 'Blink Red/Blue strobe lights on Tool at 2x horizon';
   const elLeadModeSel = mkEl('select', 'background:#0f172a;color:#fde68a;border:1px solid rgba(251,191,36,0.45);border-radius:6px;padding:2px 4px;font-family:monospace;font-size:9.5px;font-weight:700;cursor:pointer;touch-action:manipulation;outline:none;', '');
   elLeadModeSel.id = '__tt_lead_mode_sel';
-  elLeadModeSel.title = CFG.lang === 'bn' ? 'অটো অথবা ম্যানুয়াল 1x–12x / Custom ms নির্বাচন করুন' : 'Choose Auto or Manual 1x–12x multiplier or Custom ms';
+  elLeadModeSel.title = CFG.lang === 'bn' ? 'অটো অথবা ম্যানুয়াল 1x–10x / Custom ms নির্বাচন করুন' : 'Choose Auto or Manual 1x–10x multiplier or Custom ms';
   [
-    ['auto', '⚡ Auto'],
+    ['auto', '⚡ Auto (10x)'],
     ['1', '1x'],
     ['2', '2x'],
     ['3', '3x'],
+    ['4', '4x'],
     ['5', '5x'],
     ['6', '6x'],
+    ['7', '7x'],
     ['8', '8x'],
+    ['9', '9x'],
     ['10', '10x'],
-    ['12', '12x'],
     ['manual_ms', '✎ ms']
   ].forEach(([val, lbl]) => {
     const opt = document.createElement('option');
@@ -6094,6 +6525,7 @@
   elPreTrigCtrlRow.appendChild(elTopHistChip);
   elPreTrigCtrlRow.appendChild(elPreTrigRight);
   elPreTrigCtrlRow.appendChild(elTopAuto3xChip);
+  elPreTrigCtrlRow.appendChild(elTopPreSig2xChip);
   elPreTrigCtrlRow.appendChild(elLeadModeSel);
   elPreTrigCtrlRow.appendChild(elTopOpenTagsBtn);
   const elPreTrigInfoRow = mkEl('div', 'display:flex;align-items:center;justify-content:space-between;gap:5px;min-width:0;');
@@ -6351,7 +6783,7 @@
   const elPreTrigDrawerBtn = mkEl('button', 'flex:1;min-width:100px;border-radius:6px;padding:4px 5px;font-size:10px;font-weight:700;border:1px solid rgba(56,189,248,0.35);cursor:pointer;touch-action:manipulation;', T.preTrigOn);
   elPreTrigDrawerBtn.id = '__tt_pretrig_drawer_btn';
   elPreTrigDrawerBtn.type = 'button';
-  const elAuto3xDrawerBtn = mkEl('button', 'flex:1;min-width:100px;border-radius:6px;padding:4px 5px;font-size:10px;font-weight:700;border:1px solid rgba(16,185,129,0.35);cursor:pointer;touch-action:manipulation;', '⚡ Auto 3x (4-5R): ON');
+  const elAuto3xDrawerBtn = mkEl('button', 'flex:1;min-width:100px;border-radius:6px;padding:4px 5px;font-size:10px;font-weight:700;border:1px solid rgba(16,185,129,0.35);cursor:pointer;touch-action:manipulation;', '⚡ Auto 10x (Max): ON');
   elAuto3xDrawerBtn.id = '__tt_auto3x_drawer_btn';
   elAuto3xDrawerBtn.type = 'button';
   tunerToggles.appendChild(elInspOnBtn);
@@ -6974,7 +7406,7 @@
       const clkOn = CFG.clickEnabled !== false;
       elClickSwitch.textContent = clkOn
         ? '🖱 Click: ON'
-        : (CFG.lang === 'bn' ? '🚫 ক্লিক OFF (RGB)' : '🚫 Click: OFF (RGB)');
+        : (CFG.lang === 'bn' ? '🚫 ক্লিক OFF (Tool R/B)' : '🚫 Click: OFF (Tool R/B)');
       elClickSwitch.style.background = clkOn ? '#065f46' : '#881337';
       elClickSwitch.style.color = clkOn ? '#ecfdf5' : '#ffe4e6';
       elClickSwitch.style.borderColor = clkOn ? 'rgba(16,185,129,0.55)' : 'rgba(251,113,133,0.75)';
@@ -6996,16 +7428,30 @@
         elTopAuto3xChip.style.color = '#94a3b8';
         elTopAuto3xChip.style.borderColor = 'rgba(255,255,255,0.16)';
       } else {
-        elTopAuto3xChip.textContent = auto3xOn ? '⚡ 3x Auto: ON' : '⚡ 3x Auto: OFF';
+        elTopAuto3xChip.textContent = auto3xOn ? '⚡ Auto 10x: ON' : '⚡ Auto 10x: OFF';
         elTopAuto3xChip.style.background = auto3xOn ? '#065f46' : '#0f172a';
         elTopAuto3xChip.style.color = auto3xOn ? '#d1fae5' : '#94a3b8';
         elTopAuto3xChip.style.borderColor = auto3xOn ? 'rgba(16,185,129,0.55)' : 'rgba(255,255,255,0.16)';
       }
     }
+    const activeListForTop = parseTagList((elTags && elTags.value) || CFG.tags || '');
+    const primaryAutoRecTop = activeListForTop.length ? getAutoLeadRecordForTag(activeListForTop[0]) : null;
+    const primaryBoostMsTop = (primaryAutoRecTop && primaryAutoRecTop.late400RuleActive) ? (primaryAutoRecTop.late400BoostMs || LATE_400_BOOST_MS) : 0;
+    if (elTopPreSig2xChip) {
+      const sig2xOn = CFG.preSignal2xEnabled !== false;
+      const wTop = computePreSignal2xWindow(safePreLead, primaryBoostMsTop);
+      elTopPreSig2xChip.textContent = sig2xOn
+        ? ('🔴🔵 +2x' + (wTop.extraBoostMs > 0 ? '+4.8s' : '') + ':' + wTop.totalHorizonMs + 'ms')
+        : '🔴🔵 +2x: OFF';
+      elTopPreSig2xChip.style.background = sig2xOn ? '#1e1b4b' : '#0f172a';
+      elTopPreSig2xChip.style.color = sig2xOn ? '#fde68a' : '#94a3b8';
+      elTopPreSig2xChip.style.borderColor = sig2xOn ? 'rgba(255,23,68,0.55)' : 'rgba(255,255,255,0.16)';
+    }
+    if (typeof updateToolRedBlueVisuals === 'function') updateToolRedBlueVisuals();
     if (elAuto3xDrawerBtn) {
       elAuto3xDrawerBtn.textContent = curGlobalLeadMode === 'manual_mult'
         ? ('🔒 Manual ' + curGlobalLeadMult + 'x Active')
-        : (auto3xOn ? '⚡ Auto 3x+ (Server Auto): ON' : '⚡ Auto 3x+ (Server Auto): OFF');
+        : (auto3xOn ? '⚡ Auto 10x (Max): ON' : '⚡ Auto 10x (Max): OFF');
       elAuto3xDrawerBtn.style.background = curGlobalLeadMode === 'manual_mult' ? '#78350f' : (auto3xOn ? '#065f46' : '#0f172a');
       elAuto3xDrawerBtn.style.color = curGlobalLeadMode === 'manual_mult' ? '#fef3c7' : (auto3xOn ? '#d1fae5' : '#94a3b8');
     }
@@ -7026,8 +7472,8 @@
     if (elPreTrigInfo && elPreTrigBar) {
       const bestCand = typeof selectBestPreTriggerCandidate === 'function' ? selectBestPreTriggerCandidate() : null;
       const actStr = lastPreTriggerActualLeadMs != null ? (' · Act:' + lastPreTriggerActualLeadMs + 'ms') : '';
-      const activeListForAuto = parseTagList((elTags && elTags.value) || CFG.tags || '');
-      const primaryAutoRec = activeListForAuto.length ? getAutoLeadRecordForTag(activeListForAuto[0]) : null;
+      const activeListForAuto = activeListForTop;
+      const primaryAutoRec = primaryAutoRecTop;
       const verifyBadge = (primaryAutoRec && primaryAutoRec.calibrated && primaryAutoRec.appliedLeadMs > 0 && primaryAutoRec.verifyStatus)
         ? (primaryAutoRec.verifyStatus === 'DONE'
             ? ' · ✅ Done'
@@ -7039,13 +7485,16 @@
       const srvMsBadge = (primaryAutoRec && primaryAutoRec.serverAcceptMs > 0)
         ? (' · Srv:' + primaryAutoRec.serverAcceptMs + 'ms')
         : '';
+      const lateBoostTagBadge = (primaryAutoRec && primaryAutoRec.late400RuleActive)
+        ? (' · 🔴🔵-400→+4800ms')
+        : ((primaryAutoRec && primaryAutoRec.late400Streak === 1) ? (' · -400:1/2R') : '');
       const autoTagBadge = auto3xOn
         ? (primaryAutoRec && primaryAutoRec.calibrated && primaryAutoRec.appliedLeadMs > 0
-            ? (' · ⚡' + (primaryAutoRec.appliedMultiplier || 3) + 'x(' + primaryAutoRec.roundCount + 'R):' + primaryAutoRec.appliedLeadMs + 'ms' + srvMsBadge + winRateBadge + verifyBadge)
+            ? (' · ⚡' + (primaryAutoRec.appliedMultiplier || 3) + 'x(' + primaryAutoRec.roundCount + 'R):' + primaryAutoRec.appliedLeadMs + 'ms' + srvMsBadge + winRateBadge + lateBoostTagBadge + verifyBadge)
             : (primaryAutoRec && primaryAutoRec.roundCount > 0 && primaryAutoRec.roundCount < AUTO_LEAD_MIN_ROUNDS
-                ? (' · ⏳ ' + primaryAutoRec.roundCount + '/' + AUTO_LEAD_MIN_ROUNDS + 'R' + srvMsBadge + winRateBadge)
+                ? (' · ⏳ ' + primaryAutoRec.roundCount + '/' + AUTO_LEAD_MIN_ROUNDS + 'R' + srvMsBadge + winRateBadge + lateBoostTagBadge)
                 : (lastAutoLeadStatusNote ? (' · ' + lastAutoLeadStatusNote) : '')))
-        : '';
+        : lateBoostTagBadge;
       elPreTrigInfo.title = (primaryAutoRec && primaryAutoRec.verifyReason)
         ? primaryAutoRec.verifyReason
         : (CFG.lang === 'bn' ? 'প্রি-ট্রিগার ও হিস্টোরিকাল ইঞ্জিন টিউনার খুলতে ট্যাপ করুন' : 'Tap to expand Pre-Trigger & Historical Engine tuner');
@@ -7075,28 +7524,33 @@
           delete elTopApplyCandBtn.dataset.candTag;
         }
       }
+      const badgeExtraBoost = bestCand ? (bestCand.extraBoostMs || 0) : primaryBoostMsTop;
+      const badgeWin2x = computePreSignal2xWindow(bestCand ? bestCand.leadMs : safePreLead, badgeExtraBoost);
+      const sig2xBadge = CFG.preSignal2xEnabled !== false
+        ? (' · 🔴🔵+2x' + (badgeWin2x.extraBoostMs > 0 ? '+4.8s' : '') + ':' + badgeWin2x.totalHorizonMs + 'ms')
+        : '';
       if (!preTrigOn) {
         elPreTrigInfo.textContent = (!histSwitchOn ? 'Hist-Engine OFF' : 'Pre-Trigger OFF') + ' · Tracked:' + histTagStatsMap.size + autoTagBadge;
         elPreTrigInfo.style.color = '#94a3b8';
         elPreTrigBar.style.borderColor = 'rgba(148,163,184,0.28)';
       } else if (preTriggerSchedule) {
-        elPreTrigInfo.textContent = '⏱ ARMED Pre-Trig @' + preTriggerSchedule.fireOffsetMs + 'ms (-' + preTriggerSchedule.leadMs + 'ms) · ' + preTriggerSchedule.confidence + '% (' + preTriggerSchedule.samples + 'r)' + actStr + autoTagBadge;
+        elPreTrigInfo.textContent = '⏱ ARMED Pre-Trig @' + preTriggerSchedule.fireOffsetMs + 'ms (-' + preTriggerSchedule.leadMs + 'ms' + sig2xBadge + ') · ' + preTriggerSchedule.confidence + '% (' + preTriggerSchedule.samples + 'r)' + actStr + autoTagBadge;
         elPreTrigInfo.style.color = '#fde047';
         elPreTrigBar.style.borderColor = 'rgba(250,204,21,0.5)';
       } else if (preTriggerFiredThisRound) {
-        elPreTrigInfo.textContent = '⚡ Pre-Trig FIRED (-' + safePreLead + 'ms)' + actStr + autoTagBadge;
+        elPreTrigInfo.textContent = '⚡ Pre-Trig FIRED (-' + safePreLead + 'ms' + sig2xBadge + ')' + actStr + autoTagBadge;
         elPreTrigInfo.style.color = (primaryAutoRec && primaryAutoRec.verifyStatus === 'FAIL') ? '#fda4af' : '#4ade80';
         elPreTrigBar.style.borderColor = (primaryAutoRec && primaryAutoRec.verifyStatus === 'FAIL') ? 'rgba(244,63,94,0.55)' : 'rgba(74,222,128,0.5)';
       } else if (bestCand) {
-        elPreTrigInfo.textContent = '✓ Pred:' + bestCand.predOffsetMs + 'ms · Fire@' + bestCand.fireOffsetMs + 'ms (-' + bestCand.leadMs + 'ms) · ' + bestCand.confidence + '% (' + bestCand.samples + 'r)' + actStr + autoTagBadge;
+        elPreTrigInfo.textContent = '✓ Pred:' + bestCand.predOffsetMs + 'ms · Fire@' + bestCand.fireOffsetMs + 'ms (-' + bestCand.leadMs + 'ms' + sig2xBadge + ') · ' + bestCand.confidence + '% (' + bestCand.samples + 'r)' + actStr + autoTagBadge;
         elPreTrigInfo.style.color = (primaryAutoRec && primaryAutoRec.verifyStatus === 'FAIL') ? '#fda4af' : '#6ee7b7';
         elPreTrigBar.style.borderColor = (primaryAutoRec && primaryAutoRec.verifyStatus === 'FAIL') ? 'rgba(244,63,94,0.55)' : 'rgba(16,185,129,0.45)';
       } else if (lastAutoLeadStatusNote && auto3xOn) {
-        elPreTrigInfo.textContent = lastAutoLeadStatusNote + ' · Lead:-' + safePreLead + 'ms' + verifyBadge;
+        elPreTrigInfo.textContent = lastAutoLeadStatusNote + ' · Lead:-' + safePreLead + 'ms' + sig2xBadge + verifyBadge;
         elPreTrigInfo.style.color = (primaryAutoRec && primaryAutoRec.verifyStatus === 'FAIL') ? '#fda4af' : '#6ee7b7';
         elPreTrigBar.style.borderColor = (primaryAutoRec && primaryAutoRec.verifyStatus === 'FAIL') ? 'rgba(244,63,94,0.55)' : 'rgba(16,185,129,0.45)';
       } else {
-        elPreTrigInfo.textContent = '🧠 Hist-Engine: ' + histTagStatsMap.size + ' tags · Lead -' + safePreLead + 'ms (Tap tuner)' + actStr + autoTagBadge;
+        elPreTrigInfo.textContent = '🧠 Hist-Engine: ' + histTagStatsMap.size + ' tags · Lead -' + safePreLead + 'ms' + sig2xBadge + ' (Tap tuner)' + actStr + autoTagBadge;
         elPreTrigInfo.style.color = '#7dd3fc';
         elPreTrigBar.style.borderColor = 'rgba(56,189,248,0.38)';
       }
@@ -7228,7 +7682,7 @@
       const tOv = getTagLeadOverride(t);
       const ovSig = tOv ? (tOv.mode + ':' + (tOv.multiplier || '') + ':' + (tOv.manualMs || '')) : 'global';
       const aSig = autoRec
-        ? (autoRec.roundCount + ':' + (autoRec.calibrated ? 1 : 0) + ':' + (autoRec.appliedLeadMs || 0) + ':' + (autoRec.verifyStatus || '') + ':' + (autoRec.verifyReason || ''))
+        ? (autoRec.roundCount + ':' + (autoRec.calibrated ? 1 : 0) + ':' + (autoRec.appliedLeadMs || 0) + ':' + (autoRec.late400Streak || 0) + ':' + (autoRec.late400RuleActive ? 1 : 0) + ':' + (autoRec.verifyStatus || '') + ':' + (autoRec.verifyReason || ''))
         : '';
       sigParts.push(t + '|' + (isHot ? 1 : 0) + '|' + (st ? st.count : 0) + '|' + (isBad ? 1 : 0) + '|' + ovSig + '|' + aSig);
     }
@@ -7360,11 +7814,24 @@
           autoPill.textContent = '⏳' + autoRec.roundCount + '/' + AUTO_LEAD_MIN_ROUNDS + 'R';
           chip.appendChild(autoPill);
         }
+        if (autoRec.late400RuleActive || autoRec.late400Streak === 1) {
+          const latePill = document.createElement('span');
+          latePill.style.cssText = autoRec.late400RuleActive
+            ? 'font-size:9px;font-weight:800;padding:0 5px;border-radius:4px;background:rgba(30,27,75,0.92);border:1px solid rgba(56,189,248,0.65);color:#fde68a;'
+            : 'font-size:9px;font-weight:700;padding:0 4px;border-radius:4px;background:rgba(245,158,11,0.2);color:#fde68a;';
+          latePill.textContent = autoRec.late400RuleActive
+            ? ('🔴🔵-400→+' + (autoRec.late400BoostMs || LATE_400_BOOST_MS) + 'ms (800×6)')
+            : ('-400:1/' + AUTO_LEAD_MIN_ROUNDS + 'R');
+          latePill.title = autoRec.late400RuleActive
+            ? ('Crash-এর -400ms+ পরে ক্লিক (' + autoRec.late400Streak + 'R) -> 800ms×6 (+' + (autoRec.late400BoostMs || LATE_400_BOOST_MS) + 'ms) আগে টুলে লাল-নীল বাতি')
+            : ('Crash-এর -400ms+ পরে ক্লিক (1/' + AUTO_LEAD_MIN_ROUNDS + 'R)');
+          chip.appendChild(latePill);
+        }
       }
 
       const tSel = document.createElement('select');
       tSel.style.cssText = 'background:#0b1120;color:#fde68a;border:1px solid rgba(251,191,36,0.35);border-radius:4px;padding:1px 3px;font-family:monospace;font-size:9px;font-weight:700;cursor:pointer;touch-action:manipulation;';
-      [['global', 'Global'], ['auto', 'Auto'], ['1', '1x'], ['2', '2x'], ['3', '3x'], ['5', '5x'], ['6', '6x'], ['8', '8x'], ['10', '10x'], ['12', '12x'], ['manual_ms', 'ms']].forEach(([v, l]) => {
+      [['global', 'Global'], ['auto', 'Auto'], ['1', '1x'], ['2', '2x'], ['3', '3x'], ['4', '4x'], ['5', '5x'], ['6', '6x'], ['7', '7x'], ['8', '8x'], ['9', '9x'], ['10', '10x'], ['manual_ms', 'ms']].forEach(([v, l]) => {
         const o = document.createElement('option');
         o.value = v;
         o.textContent = l;
@@ -7801,6 +8268,7 @@
         humanJitter: Boolean(CFG.humanJitter || CFG.autoHumanClick !== false),
         fingerprintShuffle: Boolean(CFG.fingerprintShuffle || CFG.autoHumanClick !== false),
         autoHumanClick: Boolean(CFG.autoHumanClick !== false),
+        urgentFastClick: Boolean(lastRoundMissStreak > 0 && Date.now() - lastRoundCutoffMissedAt <= 60000),
         humanEnv: getAutoHumanEnvSnapshot(),
         opClickMode: Boolean(CFG.opClickMode !== false),
         directWsCashout: Boolean(CFG.directWsCashout !== false),
@@ -7918,6 +8386,7 @@
       predictivePreTriggerLeadMs: Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Math.round(Number(CFG.predictivePreTriggerLeadMs != null ? CFG.predictivePreTriggerLeadMs : 100)))),
       predictiveLeadTimeMs: Math.max(0, Math.min(MAX_PRETRIG_LEAD_MS, Math.round(Number(CFG.predictivePreTriggerLeadMs != null ? CFG.predictivePreTriggerLeadMs : 100)))),
       autoLead3xEnabled: Boolean(CFG.autoLead3xEnabled !== false),
+      preSignal2xEnabled: Boolean(CFG.preSignal2xEnabled !== false),
       clickEnabled: Boolean(CFG.clickEnabled !== false),
       globalLeadMode: normalizeLeadMode(CFG.globalLeadMode),
       globalLeadMultiplier: normalizeMultPreset(CFG.globalLeadMultiplier),
@@ -7962,6 +8431,8 @@
     lastMatchPreview = '';
     cancelPredictivePreTrigger('TAGS_CHANGED');
     preTriggerFiredThisRound = false;
+    preSignalFiredThisRound = false;
+    preSignalWindowInfo = null;
     roundClickLocked = false;
     roundSawFlightAfterLock = false;
     roundSawCrashAfterLock = false;
@@ -8314,10 +8785,29 @@
       setGlobalLeadConfig('manual_ms', CFG.predictivePreTriggerLeadMs);
     }
   };
+  const togglePreSignal2xSystem = () => {
+    CFG.preSignal2xEnabled = !(CFG.preSignal2xEnabled !== false);
+    if (!CFG.preSignal2xEnabled) {
+      if (preSignalTimerId) { clearTimeout(preSignalTimerId); preSignalTimerId = 0; }
+      preSignalSchedule = null;
+      if (rgbBlinkActive && rgbBlinkReason === 'PRE_SIG_2X' && typeof stopToolRedBlueLights === 'function') {
+        stopToolRedBlueLights('PRESIG_OFF', false);
+      }
+    }
+    lastUserCfgEditAt = Date.now();
+    persistHudControlState();
+    markUserTouched();
+    syncUI();
+    syncTurboCfg(true, true);
+    if (CFG.armed && CFG.preSignal2xEnabled && CFG.predictivePreTriggerEnabled !== false && CFG.histTagPredEnabled !== false && !hudHidden && (currentRoundStartMono > lastTagRoundEndMono || currentFlightStartMono > lastTagRoundEndMono)) {
+      if (maybeSchedulePredictivePreTrigger(performance.now())) syncUI();
+    }
+  };
   stopInputBubble(elHdrHistBtn);
   stopInputBubble(elTopPreTrigChip);
   stopInputBubble(elTopHistChip);
   stopInputBubble(elTopAuto3xChip);
+  stopInputBubble(elTopPreSig2xChip);
   stopInputBubble(elTopOpenTagsBtn);
   stopInputBubble(elTopApplyCandBtn);
   stopInputBubble(elClickSwitch);
@@ -8328,6 +8818,7 @@
   bindTap(elPreTrigDrawerBtn, togglePreTriggerSystem);
   bindTap(elTopHistChip, toggleHistPredEngine);
   bindTap(elTopAuto3xChip, toggleAutoLead3xSystem);
+  bindTap(elTopPreSig2xChip, togglePreSignal2xSystem);
   bindTap(elAuto3xDrawerBtn, toggleAutoLead3xSystem);
   bindTap(elClickSwitch, () => setClickEnabledState(!(CFG.clickEnabled !== false), true));
   if (elLeadModeSel) {
@@ -8502,6 +8993,8 @@
     if (lastHitTag === 'TEST') lastHitTag = '';
     cancelPredictivePreTrigger('ARM_TOGGLE');
     preTriggerFiredThisRound = false;
+    preSignalFiredThisRound = false;
+    preSignalWindowInfo = null;
     roundClickLocked = false;
     roundSawFlightAfterLock = false;
     roundSawCrashAfterLock = false;
@@ -9116,6 +9609,8 @@
     if (activeTab === 'tags') {
       cancelPredictivePreTrigger('TAGS_CLEARED');
       preTriggerFiredThisRound = false;
+      preSignalFiredThisRound = false;
+      preSignalWindowInfo = null;
       liveTagMap.clear();
       liveTagList.length = 0;
       preCrashTags.length = 0;
@@ -9167,6 +9662,8 @@
     markUserTouched();
     elBody.style.display = minimized ? 'none' : 'flex';
     elMin.textContent = minimized ? '+' : '—';
+    if (typeof updateToolRedBlueVisuals === 'function') updateToolRedBlueVisuals();
+    syncUI();
     if (!minimized && showLogs) renderLogs(true);
   });
   bindTap(elClose, () => {
@@ -9232,6 +9729,8 @@
     lastMatchPreview = '';
     cancelPredictivePreTrigger('TAG_APPLY');
     preTriggerFiredThisRound = false;
+    preSignalFiredThisRound = false;
+    preSignalWindowInfo = null;
     roundClickLocked = false;
     roundSawFlightAfterLock = false;
     roundSawCrashAfterLock = false;
@@ -9493,7 +9992,7 @@
       () => togglePreTriggerSystem()
     );
     const auto3xCardToggle = mkMiniBtn(
-      CFG.autoLead3xEnabled !== false ? '3x(4-5R): ON' : '3x(4-5R): OFF',
+      CFG.autoLead3xEnabled !== false ? '10x(Auto): ON' : '10x(Auto): OFF',
       CFG.autoLead3xEnabled !== false ? '#065f46' : '#0f172a',
       CFG.autoLead3xEnabled !== false ? '#d1fae5' : '#94a3b8',
       () => toggleAutoLead3xSystem()
@@ -9559,7 +10058,7 @@
     histModeLbl.textContent = 'Mode:';
     const histModeSel = document.createElement('select');
     histModeSel.style.cssText = 'background:#0b1120;color:#fde68a;border:1px solid rgba(251,191,36,0.35);border-radius:4px;padding:1px 3px;font-family:monospace;font-size:9.5px;font-weight:700;';
-    [['auto', 'Auto'], ['1', '1x'], ['2', '2x'], ['3', '3x'], ['5', '5x'], ['6', '6x'], ['8', '8x'], ['10', '10x'], ['12', '12x'], ['manual_ms', 'ms']].forEach(([v, l]) => {
+    [['auto', 'Auto'], ['1', '1x'], ['2', '2x'], ['3', '3x'], ['4', '4x'], ['5', '5x'], ['6', '6x'], ['7', '7x'], ['8', '8x'], ['9', '9x'], ['10', '10x'], ['manual_ms', 'ms']].forEach(([v, l]) => {
       const o = document.createElement('option');
       o.value = v;
       o.textContent = l;
@@ -9617,7 +10116,7 @@
         hBtns.style.cssText = 'display:flex;align-items:center;gap:3px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end;';
         const hModeSel = document.createElement('select');
         hModeSel.style.cssText = 'background:#0b1120;color:#fde68a;border:1px solid rgba(251,191,36,0.35);border-radius:4px;padding:1px 2px;font-family:monospace;font-size:9px;font-weight:700;';
-        [['global', 'Global'], ['auto', 'Auto'], ['1', '1x'], ['2', '2x'], ['3', '3x'], ['5', '5x'], ['6', '6x'], ['8', '8x'], ['10', '10x'], ['12', '12x'], ['manual_ms', 'ms']].forEach(([v, l]) => {
+        [['global', 'Global'], ['auto', 'Auto'], ['1', '1x'], ['2', '2x'], ['3', '3x'], ['4', '4x'], ['5', '5x'], ['6', '6x'], ['7', '7x'], ['8', '8x'], ['9', '9x'], ['10', '10x'], ['manual_ms', 'ms']].forEach(([v, l]) => {
           const o = document.createElement('option');
           o.value = v;
           o.textContent = l;
@@ -11352,7 +11851,7 @@
     };
   }
 
-  function dispatchFallbackClickAt(doc, win, x, y, holdMs, fallbackEl, onDone, fastMode) {
+  function dispatchFallbackClickAt(doc, win, x, y, holdMs, fallbackEl, onDone, fastMode, urgentFastArg) {
     let hit = null;
     if (fastMode && fbCachedWarmBtn && fbCachedWarmDoc === doc && fbCachedWarmBtn.isConnected && !isOwnHudNode(fbCachedWarmBtn)) {
       const wTxt = String(fbCachedWarmBtn.textContent || fbCachedWarmBtn.value || '').trim();
@@ -11542,7 +12041,9 @@
       }
     }
     const jitterTarget = primHit || btn || hit;
-    const autoHumanOn = CFG.autoHumanClick !== false;
+    const fastZeroMode = Boolean(CFG.zeroDelay && !CFG.humanTap);
+    const isUrgentClick = Boolean(urgentFastArg || /REAL|TURBO|RETRY/i.test(String(lastDomClickSource || '')) || (lastRoundMissStreak > 0 && Date.now() - lastRoundCutoffMissedAt <= 60000));
+    const autoHumanOn = !fastZeroMode && (CFG.autoHumanClick !== false);
     const jPt = (autoHumanOn || (!CFG.opClickMode && CFG.humanJitter))
       ? pickJitterPointOuter(doc, jitterTarget, x, y, autoHumanState.coordPx)
       : { x: Math.round(x), y: Math.round(y), jittered: false };
@@ -11553,16 +12054,21 @@
     const evY = fpProf ? Math.max(1, Number((y + fpProf.dy).toFixed(2))) : y;
     const parentEl = hit.parentElement;
     const preBtnCls = btn ? String(btn.className || '') : '';
-    const preJitMs = autoHumanOn ? Number(triRandOuter(autoHumanState.preMin, autoHumanState.preMax).toFixed(2)) : 0;
-    const postJitMs = autoHumanOn ? Number(triRandOuter(autoHumanState.postMin, autoHumanState.postMax).toFixed(2)) : 0;
-    const autoHoldPickMs = autoHumanOn ? Number(triRandOuter(autoHumanState.holdMin, autoHumanState.holdMax).toFixed(2)) : 0;
-    const effHoldMsFinal = autoHumanOn ? Math.max(Number(holdMs) || 0, autoHoldPickMs) : (holdMs > 0 ? holdMs : 0);
-    const flightAgeNow = (currentFlightStartMono > lastTagRoundEndMono) ? Math.max(0, performance.now() - currentFlightStartMono) : -1;
-    const isManualTestClk = lastDomClickSource === 'TEST';
-    const earlyFlightWaitMs = (!isManualTestClk && autoHumanOn && flightAgeNow >= 0 && flightAgeNow < autoHumanState.minFlightMs)
-      ? Math.min(180, Math.round(autoHumanState.minFlightMs - flightAgeNow))
+    const preJitMs = autoHumanOn
+      ? (isUrgentClick ? Number(Math.min(1, autoHumanState.preMin || 1).toFixed(2)) : Number(triRandOuter(autoHumanState.preMin, autoHumanState.preMax).toFixed(2)))
       : 0;
-    const totalPreMs = preJitMs + earlyFlightWaitMs;
+    const postJitMs = (autoHumanOn && !isUrgentClick) ? Number(triRandOuter(autoHumanState.postMin, autoHumanState.postMax).toFixed(2)) : 0;
+    const autoHoldPickMs = autoHumanOn
+      ? (isUrgentClick ? Number(Math.min(2, Math.max(1, autoHumanState.holdMin || 1.5)).toFixed(2)) : Number(triRandOuter(autoHumanState.holdMin, autoHumanState.holdMax).toFixed(2)))
+      : 0;
+    const effHoldMsFinal = fastZeroMode
+      ? (Number(holdMs) || 0)
+      : (isUrgentClick
+          ? Math.min(2, Math.max(Number(holdMs) || 0, autoHoldPickMs))
+          : (autoHumanOn ? Math.max(Number(holdMs) || 0, autoHoldPickMs) : (holdMs > 0 ? holdMs : 0)));
+    const isManualTestClk = lastDomClickSource === 'TEST';
+    const earlyFlightWaitMs = 0;
+    const totalPreMs = preJitMs;
     const humanSpanMs = Number((totalPreMs + effHoldMsFinal + postJitMs).toFixed(2));
     lastDomClickEl = btn || hit;
     lastDomClickMeta = {
@@ -11578,8 +12084,9 @@
       humanSpanMs: humanSpanMs,
       dryRun: CFG.clickEnabled === false
     };
-    if (typeof startTargetRgbBlink === 'function') {
-      startTargetRgbBlink(btn || hit, evX, evY, lastDomClickSource || 'CLICK', isManualTestClk);
+    if (typeof startToolRedBlueLights === 'function') {
+      const rgbMeta = typeof getActiveRgbLeadSnapshot === 'function' ? getActiveRgbLeadSnapshot(lastDomClickSource) : null;
+      startToolRedBlueLights(lastDomClickSource || 'CLICK', isManualTestClk, false, rgbMeta);
     }
     if (CFG.clickEnabled === false) {
       if (typeof onDone === 'function') {
@@ -11798,7 +12305,6 @@
             !clickOk ||
             !insideBtn ||
             live !== liveBtn ||
-            lastOutCashSentAt <= preOcUp ||
             (liveBtn.tagName !== 'BUTTON' && liveBtn.tagName !== 'INPUT')
           );
           if (needsNativeFallback) {
@@ -11808,15 +12314,33 @@
             const postNativeEnded = Boolean(lastOutCashSentAt > preOcUp || checkBtnEndedNow(liveBtn));
             if (!postNativeEnded) {
               try {
-                const pKeys = Object.keys(liveBtn);
-                for (let pki = 0; pki < pKeys.length; pki++) {
-                  if (pKeys[pki].indexOf('__reactProps$') === 0 || pKeys[pki].indexOf('__reactEventHandlers$') === 0) {
-                    const rp = liveBtn[pKeys[pki]];
-                    if (rp && typeof rp.onClick === 'function' && !liveBtn.disabled) {
-                      rp.onClick({ type: 'click', target: liveBtn, currentTarget: liveBtn, bubbles: true, cancelable: true, isTrusted: true, nativeEvent: {}, preventDefault: () => {}, stopPropagation: () => {}, persist: () => {} });
-                      break;
+                let rWalker = liveBtn;
+                for (let rw = 0; rw < 4 && rWalker && lastOutCashSentAt <= preOcUp; rw++) {
+                  const pKeys = Object.keys(rWalker);
+                  let rTriggered = false;
+                  for (let pki = 0; pki < pKeys.length; pki++) {
+                    if (pKeys[pki].indexOf('__reactProps$') === 0 || pKeys[pki].indexOf('__reactEventHandlers$') === 0) {
+                      const rp = rWalker[pKeys[pki]];
+                      const synEvt = { type: 'click', target: liveBtn, currentTarget: rWalker, bubbles: true, cancelable: true, isTrusted: true, nativeEvent: {}, preventDefault: () => {}, stopPropagation: () => {}, persist: () => {} };
+                      if (rp && typeof rp.onClick === 'function' && !rWalker.disabled) {
+                        rp.onClick(synEvt);
+                        rTriggered = true;
+                        break;
+                      }
+                      if (rp && typeof rp.onPointerUp === 'function' && !rWalker.disabled) {
+                        rp.onPointerUp(Object.assign({}, synEvt, { type: 'pointerup' }));
+                        rTriggered = true;
+                        break;
+                      }
+                      if (rp && typeof rp.onMouseUp === 'function' && !rWalker.disabled) {
+                        rp.onMouseUp(Object.assign({}, synEvt, { type: 'mouseup' }));
+                        rTriggered = true;
+                        break;
+                      }
                     }
                   }
+                  if (rTriggered || lastOutCashSentAt > preOcUp) break;
+                  rWalker = rWalker.parentElement;
                 }
               } catch {}
             }
@@ -11907,7 +12431,7 @@
     }
     if (src === 'WS-OUT' || src === 'API-REQ') {
       const outCheck = hdr + ' ' + body;
-      const isOutCash = (outCheck.includes('cashout') || outCheck.includes('cash_out') || outCheck.includes('collect') || outCheck.includes('takewin') || outCheck.includes('claim') || outCheck.includes('settle') || outCheck.includes('sell') || /"c"\s*:\s*"cashout"/.test(outCheck));
+      const isOutCash = (outCheck.includes('cashout') || outCheck.includes('cash_out') || outCheck.includes('collect') || outCheck.includes('takewin') || outCheck.includes('claim') || outCheck.includes('settle') || outCheck.includes('sell') || outCheck.includes('decision') || outCheck.includes('hf_cashout') || outCheck.includes('stop_flight') || /"c"\s*:\s*"cashout"/.test(outCheck));
       if (isOutCash) lastOutCashSentAt = Date.now();
       const outRes = isOutCash
         ? 'OUT_CASH'
@@ -11945,9 +12469,13 @@
       s.includes('round is finished') ||
       s.includes('game has ended') ||
       s.includes('cashouterror') ||
+      s.includes('cashout failed') ||
+      s.includes('cash out failed') ||
       s.includes('not received in time') ||
       s.includes('decision not processed') ||
+      s.includes('decision failed') ||
       s.includes('too late') ||
+      s.includes('expired') ||
       s.includes('158710') ||
       /"errors"\s*:\s*\[\s*\{/.test(s) ||
       /"(error|err|errorcode|code)"\s*:\s*"?[a-z1-9]/.test(s);
@@ -12188,12 +12716,18 @@
         r.verdictText = isBn
           ? ('🟠 ক্লিক আগে (Crash +' + r.crashDelta.toFixed(1) + 'ms পরে), তবে Btn ' + btnLbl + ' ছিল — Cash আসেনি')
           : ('🟠 Click before Crash (+' + r.crashDelta.toFixed(1) + 'ms), Btn was ' + btnLbl + ' — No Cash');
-      } else {
-        r.color = '#38bdf8';
-        r.borderColor = 'rgba(56,189,248,0.55)';
+      } else if (r.outRel === 'OUT_CASH') {
+        r.color = '#fb923c';
+        r.borderColor = 'rgba(251,146,60,0.55)';
         r.verdictText = isBn
-          ? ('🟢 ক্লিক আগে পড়েছে! (Crash +' + r.crashDelta.toFixed(1) + 'ms পরে) · Cash মেসেজ আসেনি')
-          : ('🟢 CLICK WAS FIRST! (Crash +' + r.crashDelta.toFixed(1) + 'ms later) · No Cash msg');
+          ? ('🟠 রিকোয়েস্ট গেছে, তবে Cash হয়নি (+' + r.crashDelta.toFixed(1) + 'ms পর Crash) → Auto x/ms বাড়ছে')
+          : ('🟠 OUT_CASH sent, no Cash before Crash (+' + r.crashDelta.toFixed(1) + 'ms) → Escalating Auto x/ms');
+      } else {
+        r.color = '#fb923c';
+        r.borderColor = 'rgba(251,146,60,0.55)';
+        r.verdictText = isBn
+          ? ('🟠 ক্লিক হয়েছে (+' + r.crashDelta.toFixed(1) + 'ms পর Crash), তবে OUT_CASH যায়নি — বাটন পিন যাচাই করুন')
+          : ('🟠 Click before Crash (+' + r.crashDelta.toFixed(1) + 'ms), no OUT_CASH sent — Check button pin');
       }
     } else if (r.endedByBtn) {
       r.color = '#fbbf24';
@@ -12225,7 +12759,7 @@
   function isPostCrashTagPattern(rawTags) {
     const s = String(rawTags || '').toLowerCase();
     if (!s) return false;
-    return /(crashx|newstateid\s*[:=]\s*3|stopcoefficient|stop_coefficient|stopcoeff|finishgame|finish_game|endgame|game_end|game_over|round_end|round_over|round_finish|roundfinish|game_finish|gamefinish|stopgame|stop_game|oncrash|onroundend|ongameend|onfinish|finalvalue|crashed|fly_away|flew_off|flew off|busted|resulttime|gameresult|roundresult|cashouterror|cashoutclosed|decisionclosed|bettingclosed|"gr"\s*:|\bgr\b\s*[:=])/.test(s);
+    return /(crashx|newstateid\s*[:=]\s*3|stopcoefficient|stop_coefficient|stopcoeff|finishgame|finish_game|endgame|game_end|game_over|round_end|round_over|round_finish|roundfinish|game_finish|gamefinish|stopgame|stop_game|oncrash|onroundend|ongameend|onfinish|finalvalue|crashed|fly_away|flew_off|flew off|busted|resulttime|gameresult|roundresult|cashouterror|cashoutclosed|decisionclosed|bettingclosed|decision_not_processed|not_received_in_time|cashout_failed|"gr"\s*:|\bgr\b\s*[:=])/.test(s);
   }
 
   function updateRaceBoxUI() {
@@ -12362,10 +12896,10 @@
       return;
     }
     const toolAt = typeof item.toolMonoMs === 'number' ? item.toolMonoMs : item.monoMs;
-    const realMono = Math.max(toolAt, flushedAt);
-    item.monoMs = realMono;
-    item.gameMonoMs = realMono;
-    item.holdAppliedMs = Math.max(0, realMono - toolAt);
+    const flushAt = Math.max(toolAt, flushedAt);
+    item.monoMs = toolAt;
+    item.gameMonoMs = flushAt;
+    item.holdAppliedMs = Math.max(0, flushAt - toolAt);
     item.pendingFlush = false;
     if (item.holdAppliedMs >= 1) {
       const nowGateSec = Date.now();
@@ -12543,13 +13077,13 @@
     const estGameMono = earlyFlushedAt !== undefined
       ? Math.max(toolMonoMs, earlyFlushedAt)
       : (gated ? (toolMonoMs + gateEst) : toolMonoMs);
-    const effMonoMs = Math.max(toolMonoMs, estGameMono);
+    const effMonoMs = toolMonoMs;
     pushRaceTimelineItem({
       time: timeStr,
       monoMs: effMonoMs,
       toolMonoMs: toolMonoMs,
-      gameMonoMs: effMonoMs,
-      holdAppliedMs: earlyFlushedAt !== undefined ? Math.max(0, effMonoMs - toolMonoMs) : gateEst,
+      gameMonoMs: Math.max(toolMonoMs, estGameMono),
+      holdAppliedMs: earlyFlushedAt !== undefined ? Math.max(0, estGameMono - toolMonoMs) : gateEst,
       pendingFlush: earlyFlushedAt !== undefined ? false : gated,
       gateId: gateIdVal,
       src: src,
@@ -12574,7 +13108,7 @@
         else broadcastDownToIframes({ __TT_SNIFFER__: true, kind: 'CASH_ACK_SYNC', ts: lastCashAckAt, srcFrame: FRAME_ID });
       } catch {}
     } else if (raceKind === 'START') {
-      if (rgbBlinkActive && !rgbBlinkIsTest && performance.now() - rgbBlinkStartedAt >= 120 && typeof stopTargetRgbBlink === 'function') {
+      if (rgbBlinkActive && !rgbBlinkIsTest && !curAutoRoundTiming.btnWasLiveInRound && performance.now() - rgbBlinkStartedAt >= 450 && typeof stopTargetRgbBlink === 'function') {
         stopTargetRgbBlink('START', false);
       }
       if (curAutoRoundTiming.crashMono > 0 || curAutoRoundTiming.clickMono > 0 || curAutoRoundTiming.tagArrivals.size > 0) {
@@ -12820,26 +13354,40 @@
     const postTxt = btn.isConnected ? (btn.innerText || btn.textContent || btn.value || '').trim() : '';
     if (postDis || isButtonAlreadyEnded(postTxt, postDis, btn)) return true;
     try {
-      const pKeys = Object.keys(btn);
-      for (let i = 0; i < pKeys.length; i++) {
-        if (pKeys[i].indexOf('__reactProps$') === 0 || pKeys[i].indexOf('__reactEventHandlers$') === 0) {
-          const rp = btn[pKeys[i]];
-          if (rp && typeof rp.onClick === 'function' && !btn.disabled) {
-            rp.onClick({ type: 'click', target: btn, currentTarget: btn, bubbles: true, cancelable: true, isTrusted: true, nativeEvent: {}, preventDefault: () => {}, stopPropagation: () => {}, persist: () => {} });
-            return true;
+      let rWalk = btn;
+      for (let rw = 0; rw < 4 && rWalk && lastOutCashSentAt <= prevOc; rw++) {
+        const pKeys = Object.keys(rWalk);
+        for (let i = 0; i < pKeys.length; i++) {
+          if (pKeys[i].indexOf('__reactProps$') === 0 || pKeys[i].indexOf('__reactEventHandlers$') === 0) {
+            const rp = rWalk[pKeys[i]];
+            const synEvt = { type: 'click', target: btn, currentTarget: rWalk, bubbles: true, cancelable: true, isTrusted: true, nativeEvent: {}, preventDefault: () => {}, stopPropagation: () => {}, persist: () => {} };
+            if (rp && typeof rp.onClick === 'function' && !rWalk.disabled) {
+              rp.onClick(synEvt);
+              return true;
+            }
+            if (rp && typeof rp.onPointerUp === 'function' && !rWalk.disabled) {
+              rp.onPointerUp(Object.assign({}, synEvt, { type: 'pointerup' }));
+              return true;
+            }
+            if (rp && typeof rp.onMouseUp === 'function' && !rWalk.disabled) {
+              rp.onMouseUp(Object.assign({}, synEvt, { type: 'mouseup' }));
+              return true;
+            }
           }
         }
+        rWalk = rWalk.parentElement;
       }
     } catch {}
     return true;
   }
 
-  function dispatchDirectProtocolCashout() {
+  function dispatchDirectProtocolCashout(urgent) {
     if (CFG.clickEnabled === false || CFG.directWsCashout === false) return;
     try {
       const payload = JSON.stringify({
         roundId: latestRoundMeta.roundId || '',
         betId: latestRoundMeta.betId || '',
+        urgent: Boolean(urgent),
         ts: Date.now()
       });
       dispatchPageStrEvent('__TT_DIRECT_CASHOUT__', payload, false);
@@ -12849,7 +13397,7 @@
     } catch {}
   }
 
-  function armCashoutWatchdog(outCashBefore, fx, fy, fallbackBtn, sourceLabel) {
+  function armCashoutWatchdog(outCashBefore, fx, fy, fallbackBtn, sourceLabel, effHoldDelayMs) {
     if (CFG.clickEnabled === false || sourceLabel === 'TEST') return;
     const canRetryForThisClick = Boolean(
       !lastDomClickMeta ||
@@ -12858,6 +13406,7 @@
     if (!canRetryForThisClick) return;
     const armedCashAckAt = lastCashAckAt;
     const armedCrashAt = lastRoundCrashAt;
+    const holdOff = Math.max(0, Math.min(250, Math.round(Number(effHoldDelayMs) || 0)));
     const checkBtnTransitioned = (b) => {
       if (!b || !b.isConnected) return true;
       const bt = (b.innerText || b.textContent || b.value || '').trim();
@@ -12872,7 +13421,7 @@
         if (checkBtnTransitioned(b1)) return;
         triggerReactAndDomClick(b1);
       } catch {}
-    }, 16);
+    }, Math.max(8, holdOff + 6));
     setTimeout(() => {
       try {
         if (lastOutCashSentAt > outCashBefore || lastCashAckAt > armedCashAckAt || lastRoundCrashAt > armedCrashAt) return;
@@ -12887,10 +13436,21 @@
           CFG.directWsCashout !== false &&
           (domRetried || (lastDomClickMeta && isLiveCashoutBtnText(String(lastDomClickMeta.preText || '').toLowerCase())))
         ) {
-          dispatchDirectProtocolCashout();
+          dispatchDirectProtocolCashout(true);
         }
       } catch {}
-    }, 38);
+    }, Math.max(22, holdOff + 16));
+    setTimeout(() => {
+      try {
+        if (lastOutCashSentAt > outCashBefore || lastCashAckAt > armedCashAckAt || lastRoundCrashAt > armedCrashAt) return;
+        if (CFG.roundOnce && roundSawCrashAfterLock) return;
+        const b3 = (fallbackBtn && fallbackBtn.isConnected) ? fallbackBtn : findFallbackBtnOuter(document, fx, fy);
+        if (b3 && !checkBtnTransitioned(b3)) {
+          triggerReactAndDomClick(b3);
+          scheduleSyncUI();
+        }
+      } catch {}
+    }, Math.max(55, holdOff + 45));
   }
 
   function extractLiveMultFromText(rawText, pktAn) {
@@ -12967,8 +13527,9 @@
   setTimeout(() => { if ((Number(CFG.autoCashoutCeilingX) || 0) >= 1.01) syncGameAutoCashoutBox(true); }, 1000);
   setInterval(() => { if (!document.hidden && (Number(CFG.autoCashoutCeilingX) || 0) >= 1.01) syncGameAutoCashoutBox(false); }, 1500);
 
-  function fireClickAtCoords(x, y, holdMs, tStart, fallbackEl, sourceLabel, onDone) {
+  function fireClickAtCoords(x, y, holdMs, tStart, fallbackEl, sourceLabel, onDone, urgentFast) {
     lastDomClickSource = String(sourceLabel || '');
+    const isUrgentClick = Boolean(urgentFast);
     const outCashBeforeTop = lastOutCashSentAt;
     const seq = ++crossRestoreSeq;
     const prevRootPE = root.style.pointerEvents;
@@ -13014,7 +13575,7 @@
           targetWin.__ttPageClickDone = false;
           window.__ttPageClickDone = false;
         }
-        const payload = JSON.stringify({ x: x, y: y, holdMs: holdMs, fast: true });
+        const payload = JSON.stringify({ x: x, y: y, holdMs: holdMs, fast: true, urgentFast: isUrgentClick });
         let ackGot = false;
         let ackOk = false;
         let ackMeta = null;
@@ -13067,16 +13628,55 @@
       } catch {}
     }
 
+    let telemetryFinalized = false;
+    const finalizeClickUiAndTelemetry = (didClick, actualPerf) => {
+      if (telemetryFinalized) return;
+      telemetryFinalized = true;
+      const finalPerf = (typeof actualPerf === 'number' && actualPerf > 0) ? actualPerf : performance.now();
+      const clickTime = fmtTimeMs(new Date());
+      const elapsed = Math.max(0, finalPerf - tStart).toFixed(2);
+      const effMeta = lastDomClickMeta || clickMeta;
+
+      triggerCount += 1;
+      lastReactionMsStr = elapsed;
+      elPerf.textContent = elapsed + 'ms';
+      elPerf.style.color = '#4ade80';
+      crosshair.style.transform = 'scale(0.86)';
+      crosshair.style.borderColor = '#facc15';
+      setTimeout(() => {
+        crosshair.style.transform = 'scale(1)';
+        crosshair.style.borderColor = locked ? '#f59e0b' : (CFG.armed ? '#22c55e' : '#94a3b8');
+      }, 140);
+      if (sourceLabel && sourceLabel !== 'TEST') {
+        const rawDeltaMs = Math.max(0, finalPerf - tStart);
+        recordLatencySample(
+          rawDeltaMs,
+          sourceLabel,
+          clickTime,
+          CFG.preClickGate ? Math.max(Number(CFG.wsLeadMs) || 0, Number(CFG.gateHoldMs) || 0) : 0
+        );
+        recordSecurityLatency(rawDeltaMs, sourceLabel, clickTime);
+      }
+      const clickMetaWithCtx = Object.assign({}, effMeta || {}, {
+        holdMs: Number(holdMs) || 0,
+        syncFrame: Boolean(CFG.zeroDelay && sourceLabel && sourceLabel !== 'TEST'),
+        frameStartMonoMs: (typeof tStart === 'number' && tStart > 0) ? tStart : undefined
+      });
+      recordClickRace(finalPerf, clickTime, elapsed, sourceLabel || lastHitTag || 'TAP', clickMetaWithCtx);
+      armCashoutWatchdog(outCashBeforeTop, x, y, fallbackEl || null, sourceLabel, 0);
+      if (typeof onDone === 'function') {
+        try { onDone(Boolean(didClick), finalPerf); } catch {}
+      }
+      syncUI();
+    };
+
     if (!clicked) {
       fallbackHandledDone = true;
-      clicked = dispatchFallbackClickAt(document, document.defaultView || window, x, y, holdMs, fallbackEl || null, onDone, true);
+      clicked = dispatchFallbackClickAt(document, document.defaultView || window, x, y, holdMs, fallbackEl || null, finalizeClickUiAndTelemetry, true, isUrgentClick);
       if (lastDomClickMeta) clickMeta = lastDomClickMeta;
     }
 
     if (needHideHud) root.style.visibility = prevRootVis;
-    const clickPerf = performance.now();
-    const clickTime = fmtTimeMs(new Date());
-    const elapsed = (clickPerf - tStart).toFixed(2);
 
     root.style.pointerEvents = prevRootPE || 'none';
     panel.style.pointerEvents = prevPanelPE;
@@ -13094,42 +13694,13 @@
       restoreCrosshair();
     }
 
-    if (!fallbackHandledDone && typeof onDone === 'function') {
+    if (!fallbackHandledDone) {
       if (clicked && effHumanHoldMs > 0) {
-        setTimeout(() => { try { onDone(true, performance.now()); } catch {} }, effHumanHoldMs + 2);
+        setTimeout(() => finalizeClickUiAndTelemetry(true, performance.now()), effHumanHoldMs + 2);
       } else {
-        try { onDone(clicked, clickPerf); } catch {}
+        finalizeClickUiAndTelemetry(clicked, performance.now());
       }
     }
-
-    triggerCount += 1;
-    lastReactionMsStr = elapsed;
-    elPerf.textContent = elapsed + 'ms';
-    elPerf.style.color = '#4ade80';
-    crosshair.style.transform = 'scale(0.86)';
-    crosshair.style.borderColor = '#facc15';
-    setTimeout(() => {
-      crosshair.style.transform = 'scale(1)';
-      crosshair.style.borderColor = locked ? '#f59e0b' : (CFG.armed ? '#22c55e' : '#94a3b8');
-    }, 140);
-    if (sourceLabel && sourceLabel !== 'TEST') {
-      const rawDeltaMs = Math.max(0, clickPerf - tStart);
-      recordLatencySample(
-        rawDeltaMs,
-        sourceLabel,
-        clickTime,
-        CFG.preClickGate ? Math.max(Number(CFG.wsLeadMs) || 0, Number(CFG.gateHoldMs) || 0) : 0
-      );
-      recordSecurityLatency(rawDeltaMs, sourceLabel, clickTime);
-    }
-    const clickMetaWithCtx = Object.assign({}, clickMeta || {}, {
-      holdMs: Number(holdMs) || 0,
-      syncFrame: Boolean(CFG.zeroDelay && sourceLabel && sourceLabel !== 'TEST'),
-      frameStartMonoMs: (typeof tStart === 'number' && tStart > 0) ? tStart : undefined
-    });
-    recordClickRace(clickPerf, clickTime, elapsed, sourceLabel || lastHitTag || 'TAP', clickMetaWithCtx);
-    armCashoutWatchdog(outCashBeforeTop, x, y, fallbackEl || null, sourceLabel);
-    syncUI();
   }
 
   let lastDomClickEl = null;
@@ -13156,7 +13727,7 @@
     }
     emitRetryQueueDepth(0, 'CLEAR');
   }
-  function fireTargetClick(sourceLabel, tStart, onDone) {
+  function fireTargetClick(sourceLabel, tStart, onDone, urgentFast) {
     lastHitTag = String(sourceLabel || 'HIT').slice(0, 26);
     if (!locked && !isDraggingTarget && (!anchor.el || !anchor.el.isConnected)) {
       syncPositionFromAnchor();
@@ -13179,10 +13750,11 @@
       }
     }
     clampTarget();
+    const isUrgent = Boolean(urgentFast || (lastRoundMissStreak > 0 && Date.now() - lastRoundCutoffMissedAt <= 60000) || (sourceLabel && !/^(?:TEST|PRED-)/i.test(String(sourceLabel))));
     const holdMs = CFG.zeroDelay
       ? Math.max(0, Math.min(5, Math.round((Number(CFG.zeroDelayMicroMs) || 0) * 2) / 2))
-      : (CFG.humanTap ? 35 : 0);
-    fireClickAtCoords(targetX, targetY, holdMs, tStart, anchoredEl, sourceLabel, onDone);
+      : (isUrgent ? Math.min(2, CFG.humanTap ? 2 : 0) : (CFG.humanTap ? 35 : 0));
+    fireClickAtCoords(targetX, targetY, holdMs, tStart, anchoredEl, sourceLabel, onDone, isUrgent);
   }
 
   bindTap(elTest, () => {
@@ -13349,7 +13921,8 @@
           typeof turboInfo.clickX === 'number' ? turboInfo.clickX : targetX,
           typeof turboInfo.clickY === 'number' ? turboInfo.clickY : targetY,
           null,
-          lbl
+          lbl,
+          typeof turboInfo.humanSpanMs === 'number' ? turboInfo.humanSpanMs : 0
         );
       }
       if (isIframe && turboInfo.fromLocalIframe && !turboBadClick) {
@@ -13423,7 +13996,7 @@
               lastTriggerAt = 0;
               if (CFG.oneShot) { CFG.armed = true; persistHudControlState(); }
               clearPendingTargetRetry();
-              let rtLeft = 38;
+              let rtLeft = 64;
               let rtRunning = false;
               let retryBtnRef = (lastDomClickEl && lastDomClickEl.isConnected && !isOwnHudNode(lastDomClickEl)) ? lastDomClickEl : null;
               emitRetryQueueDepth(1, 'BTN_OFF_OR_DISABLED');
@@ -13473,7 +14046,7 @@
                     if (CFG.oneShot) { CFG.armed = false; persistHudControlState(); syncTurboCfg(true, false); syncUI(); }
                     return;
                   }
-                  if (rtLeft > 0) pendingTargetRetryTimer = setTimeout(runRt, 16);
+                  if (rtLeft > 0) pendingTargetRetryTimer = setTimeout(runRt, rtLeft > 48 ? 2 : 6);
                   else finalizeRetryExhausted();
                 } finally {
                   rtRunning = false;
@@ -13497,7 +14070,7 @@
                   }
                 } catch {}
               }
-              pendingTargetRetryTimer = setTimeout(runRt, 16);
+              pendingTargetRetryTimer = setTimeout(runRt, 2);
             }
           }
         } else {
@@ -13531,6 +14104,8 @@
             const isStaleUnlock = matched === null && ((lockAge >= 4500 && !roundSawFlightAfterLock) || (roundSawFlightAfterLock && roundLastFlightAt > 0 && nowUnlockMs - roundLastFlightAt >= 3500 && lockAge >= 4500) || lockAge >= 25000);
             if (isCrashUnlock || isRoundChangeUnlock || isStartUnlock || isStaleUnlock) {
               preTriggerFiredThisRound = false;
+              preSignalFiredThisRound = false;
+              preSignalWindowInfo = null;
               cancelPredictivePreTrigger('ROUND_UNLOCK');
               roundClickLocked = false;
               roundSawFlightAfterLock = false;
@@ -14579,7 +15154,7 @@
     try {
       const hasUrgent = Boolean(forceNow) || compactBatch.some((ev) => ev && (ev.matched || ev.inspectorMatched || ev.src === 'CLICK' || ev.src === 'RETRY' || ev.src === 'ELEMENT_PICK'));
       const nowB = Date.now();
-      if (!hasUrgent && nowB - lastGmBridgeFlushAt < 45) return;
+      if (!hasUrgent && nowB - lastGmBridgeFlushAt < 180) return;
       const hasUseful = CFG.armed || CFG.showFeed || compactBatch.some((ev) => ev && (ev.matched || ev.inspectorMatched || ev.src === 'WS-IN' || ev.src === 'WS-OUT' || ev.src === 'SSE' || ev.src === 'WORKER' || ev.src === 'API-RES' || ev.src === 'TAP-RES' || ev.src === 'TAP-RTC' || ev.src === 'TAP-WT' || ev.src === 'TAP-PM' || ev.src === 'CSS-STATE' || ev.src === 'JS-HOOK' || ev.src === 'DOM-TAG' || ev.src === 'CLICK' || ev.src === 'LATENCY' || ev.src === 'ELEMENT_PICK'));
       if (!hasUseful) return;
       lastGmBridgeFlushAt = nowB;
@@ -15265,6 +15840,7 @@
     if (typeof c.histTagPredEnabled === 'boolean') CFG.histTagPredEnabled = c.histTagPredEnabled;
     if (typeof c.predictivePreTriggerEnabled === 'boolean') CFG.predictivePreTriggerEnabled = c.predictivePreTriggerEnabled;
     if (typeof c.autoLead3xEnabled === 'boolean') CFG.autoLead3xEnabled = c.autoLead3xEnabled;
+    if (typeof c.preSignal2xEnabled === 'boolean') CFG.preSignal2xEnabled = c.preSignal2xEnabled;
     if (typeof c.clickEnabled === 'boolean') CFG.clickEnabled = c.clickEnabled;
     if (c.globalLeadMode === 'auto' || c.globalLeadMode === 'manual_mult' || c.globalLeadMode === 'manual_ms') {
       CFG.globalLeadMode = c.globalLeadMode;
@@ -15498,11 +16074,13 @@
         try { dispatchPageStrEvent('__TT_PAGE_CRASH_SYNC__', '', false); } catch {}
         broadcastDownToIframes(d);
       } else if (d.kind === 'RGB_BLINK_START') {
-        if (typeof startTargetRgbBlink === 'function') startTargetRgbBlink(null, d.x, d.y, d.reason || 'IFR', Boolean(d.isTest), true);
+        if (typeof startTargetRgbBlink === 'function') startTargetRgbBlink(null, d.x, d.y, d.reason || 'IFR', Boolean(d.isTest), true, d.meta);
       } else if (d.kind === 'RGB_BLINK_STOP') {
         if (typeof stopTargetRgbBlink === 'function') stopTargetRgbBlink(d.reason || 'IFR_STOP', true);
       } else if (d.kind === 'ROUND_UNLOCK') {
         preTriggerFiredThisRound = false;
+        preSignalFiredThisRound = false;
+        preSignalWindowInfo = null;
         cancelPredictivePreTrigger('ROUND_UNLOCK');
         if (typeof stopTargetRgbBlink === 'function') stopTargetRgbBlink('ROUND_UNLOCK', true);
         if (CFG.roundOnce && roundClickLocked && Date.now() - roundClickLockedAt >= 60) {
@@ -15636,6 +16214,8 @@
               const bStale = !item.matched && ((bLockAge >= 4500 && !roundSawFlightAfterLock) || (roundSawFlightAfterLock && roundLastFlightAt > 0 && bNowMs - roundLastFlightAt >= 3500 && bLockAge >= 4500) || bLockAge >= 25000);
               if (bPlainCrash || bRoundDiffFirst || bStart || bStale) {
                 preTriggerFiredThisRound = false;
+                preSignalFiredThisRound = false;
+                preSignalWindowInfo = null;
                 cancelPredictivePreTrigger('BATCH_UNLOCK');
                 roundClickLocked = false;
                 roundSawFlightAfterLock = false;
@@ -15781,6 +16361,8 @@
       } else if (d.kind === 'ROUND_UNLOCK') {
         lastTopMsgAt = Date.now();
         preTriggerFiredThisRound = false;
+        preSignalFiredThisRound = false;
+        preSignalWindowInfo = null;
         cancelPredictivePreTrigger('IFRAME_ROUND_UNLOCK');
         if (CFG.roundOnce && roundClickLocked && Date.now() - roundClickLockedAt >= 60) {
           roundClickLocked = false;
@@ -15807,7 +16389,7 @@
         try { dispatchPageStrEvent('__TT_PAGE_CRASH_SYNC__', '', false); } catch {}
         broadcastDownToIframes(d);
       } else if (d.kind === 'RGB_BLINK_START') {
-        if (typeof startTargetRgbBlink === 'function') startTargetRgbBlink(null, d.x, d.y, d.reason || 'TOP', Boolean(d.isTest), true);
+        if (typeof startTargetRgbBlink === 'function') startTargetRgbBlink(null, d.x, d.y, d.reason || 'TOP', Boolean(d.isTest), true, d.meta);
         broadcastDownToIframes(d);
       } else if (d.kind === 'RGB_BLINK_STOP') {
         if (typeof stopTargetRgbBlink === 'function') stopTargetRgbBlink(d.reason || 'TOP_STOP', true);
@@ -16017,6 +16599,8 @@
   };
   const onPageUnlockEvent = () => {
     preTriggerFiredThisRound = false;
+    preSignalFiredThisRound = false;
+    preSignalWindowInfo = null;
     cancelPredictivePreTrigger('PAGE_UNLOCK');
     if (CFG.roundOnce && roundClickLocked) {
       roundClickLocked = false;
@@ -16138,7 +16722,8 @@
           if (typeof d === 'string') d = JSON.parse(d);
           if (!d) return;
           if (typeof startTargetRgbBlink === 'function') {
-            startTargetRgbBlink(null, d.x, d.y, d.reason || 'PAGE_CLICK', Boolean(d.isTest));
+            const rgbSnap = typeof getActiveRgbLeadSnapshot === 'function' ? getActiveRgbLeadSnapshot(d.preText) : null;
+            startTargetRgbBlink(null, d.x, d.y, d.reason || 'PAGE_CLICK', Boolean(d.isTest), false, rgbSnap);
           }
         } catch {}
       };
@@ -16354,6 +16939,7 @@
           humanJitter: Boolean(CFG.humanJitter || CFG.autoHumanClick !== false),
           fingerprintShuffle: Boolean(CFG.fingerprintShuffle || CFG.autoHumanClick !== false),
           autoHumanClick: Boolean(CFG.autoHumanClick !== false),
+          urgentFastClick: Boolean(lastRoundMissStreak > 0 && Date.now() - lastRoundCutoffMissedAt <= 60000),
           humanEnv: getAutoHumanEnvSnapshot(),
           opClickMode: Boolean(CFG.opClickMode !== false),
           directWsCashout: Boolean(CFG.directWsCashout !== false),
@@ -16981,21 +17567,19 @@
             'var isOkFast=function(el){return Boolean(el&&el.isConnected&&el.id!==HUD_ID&&!(el.closest&&el.closest("#"+HUD_ID))&&el.tagName!=="BODY"&&el.tagName!=="HTML"&&el.tagName!=="IFRAME"&&!el.hidden&&!tIsAutoCashStr("",el));};' +
             'var isOkVis=function(el){try{var cs=((doc&&doc.defaultView)?doc.defaultView:window).getComputedStyle(el);if(cs&&(cs.display==="none"||cs.visibility==="hidden"||cs.opacity==="0"||cs.pointerEvents==="none"))return false;}catch(ecs){}var r=el.getBoundingClientRect();return r.width>2&&r.height>2;};' +
             'var elNorm=function(el){return String(el.textContent||el.value||(el.getAttribute&&el.getAttribute("aria-label"))||"").trim().toLowerCase().split(String.fromCharCode(10)).join(" ");};' +
-            'var matchesWant=function(bt){if(!txt)return true;if(!bt)return false;var btNs=bt.split(" ").join("");return bt.indexOf(txt)!==-1||(Boolean(txtNs)&&btNs.indexOf(txtNs)!==-1);};' +
+            'var matchesWant=function(bt,el){if(tIsAutoCashStr(bt,el))return false;if(!tIsWrongBtnState(bt,false,el)&&(bt.indexOf("cash")!==-1||bt.indexOf("take")!==-1||bt.indexOf("collect")!==-1||bt.indexOf("claim")!==-1||bt.indexOf("withdraw")!==-1||bt.indexOf("settle")!==-1||bt.indexOf("উত্তোলন")!==-1||bt.indexOf("ক্যাশ")!==-1||tIsNumPayout(bt)))return true;if(!txt)return false;if(!bt)return false;var btNs=bt.split(" ").join("");return bt.indexOf(txt)!==-1||(Boolean(txtNs)&&btNs.indexOf(txtNs)!==-1);};' +
             'var qBest=null,qDist=1e9,qIdeal=false;' +
             'if(sel){' +
               'var qList=tQDeep(doc,sel);' +
-              'for(var qi=0;qi<qList.length;qi++){var qe=qList[qi];if(!isOkFast(qe)||!isOkVis(qe))continue;var qr=qe.getBoundingClientRect();var qd=Math.hypot((qr.left+qr.width/2)-x,(qr.top+qr.height/2)-y);if(qd>360)continue;var qDis=Boolean(qe.disabled||(qe.getAttribute&&qe.getAttribute("aria-disabled")==="true"));var qTxt=elNorm(qe);var qWrong=tIsWrongBtnState(qTxt,qDis,qe);var qWant=matchesWant(qTxt);var qOk=!qDis&&!qWrong&&qWant;var qScore=qd+(qDis?5000:0)+(qWrong?4000:0)+(qWant?0:2500);if(qScore<qDist){qDist=qScore;qBest=qe;qIdeal=qOk;}}' +
+              'for(var qi=0;qi<qList.length;qi++){var qe=qList[qi];if(!isOkFast(qe)||!isOkVis(qe))continue;var qr=qe.getBoundingClientRect();var qd=Math.hypot((qr.left+qr.width/2)-x,(qr.top+qr.height/2)-y);if(qd>360)continue;var qDis=Boolean(qe.disabled||(qe.getAttribute&&qe.getAttribute("aria-disabled")==="true"));var qTxt=elNorm(qe);var qWrong=tIsWrongBtnState(qTxt,qDis,qe);var qWant=matchesWant(qTxt,qe);var qOk=!qDis&&!qWrong&&qWant;var qScore=qd+(qDis?5000:0)+(qWrong?4000:0)+(qWant?0:2500);if(qScore<qDist){qDist=qScore;qBest=qe;qIdeal=qOk;}}' +
               'if(qBest&&qIdeal)return qBest;' +
             '}' +
             'var bestTxt=null,bd=1e9,bIdeal=false;' +
-            'if(txt){' +
-              'var bs=tQDeep(doc,"button,a,[role=button],input[type=button],input[type=submit],[onclick],[class*=btn],[class*=button]");' +
-              'for(var i=0;i<bs.length;i++){var b=bs[i];if(!isOkFast(b))continue;var bt=elNorm(b);if(!bt||!matchesWant(bt))continue;if(!isOkVis(b))continue;var br=b.getBoundingClientRect();var d=Math.hypot((br.left+br.width/2)-x,(br.top+br.height/2)-y);if(d>520)continue;var bDis=Boolean(b.disabled||(b.getAttribute&&b.getAttribute("aria-disabled")==="true"));var bWrong=tIsWrongBtnState(bt,bDis,b);var okNow=!bDis&&!bWrong;var sc=d+(bDis?5000:0)+(bWrong?4000:0)+(bt===txt?0:40);if(sc<bd){bd=sc;bestTxt=b;bIdeal=okNow;}}' +
-              'if(!bestTxt){' +
-                'var ds=tQDeep(doc,"div,span");' +
-                'for(var j=0;j<Math.min(ds.length,180);j++){var de=ds[j];if(!isOkFast(de)||de.childElementCount>4)continue;var dt=elNorm(de);if(!dt||dt.length>42||!matchesWant(dt))continue;if(!isOkVis(de))continue;var dr=de.getBoundingClientRect();if(dr.width>360||dr.height>140)continue;var d2=Math.hypot((dr.left+dr.width/2)-x,(dr.top+dr.height/2)-y);if(d2>420)continue;var dDis=Boolean(de.disabled||(de.getAttribute&&de.getAttribute("aria-disabled")==="true"));var dWrong=tIsWrongBtnState(dt,dDis,de);var okD=!dDis&&!dWrong;var sc2=d2+(dDis?5000:0)+(dWrong?4000:0)+(dt===txt?0:60);if(sc2<bd){bd=sc2;bestTxt=de;bIdeal=okD;}}' +
-              '}' +
+            'var bs=tQDeep(doc,"button,a,[role=button],input[type=button],input[type=submit],[class*=cashout],[class*=cash-out],[onclick],[class*=btn],[class*=button]");' +
+            'for(var i=0;i<bs.length;i++){var b=bs[i];if(!isOkFast(b))continue;var bt=elNorm(b);if(!bt||!matchesWant(bt,b))continue;if(!isOkVis(b))continue;var br=b.getBoundingClientRect();var d=Math.hypot((br.left+br.width/2)-x,(br.top+br.height/2)-y);if(d>520)continue;var bDis=Boolean(b.disabled||(b.getAttribute&&b.getAttribute("aria-disabled")==="true"));var bWrong=tIsWrongBtnState(bt,bDis,b);var okNow=!bDis&&!bWrong;var sc=d+(bDis?5000:0)+(bWrong?4000:0)+(bt===txt?0:40);if(sc<bd){bd=sc;bestTxt=b;bIdeal=okNow;}}' +
+            'if(!bestTxt){' +
+              'var ds=tQDeep(doc,"div,span");' +
+              'for(var j=0;j<Math.min(ds.length,180);j++){var de=ds[j];if(!isOkFast(de)||de.childElementCount>4)continue;var dt=elNorm(de);if(!dt||dt.length>42||!matchesWant(dt,de))continue;if(!isOkVis(de))continue;var dr=de.getBoundingClientRect();if(dr.width>360||dr.height>140)continue;var d2=Math.hypot((dr.left+dr.width/2)-x,(dr.top+dr.height/2)-y);if(d2>420)continue;var dDis=Boolean(de.disabled||(de.getAttribute&&de.getAttribute("aria-disabled")==="true"));var dWrong=tIsWrongBtnState(dt,dDis,de);var okD=!dDis&&!dWrong;var sc2=d2+(dDis?5000:0)+(dWrong?4000:0)+(dt===txt?0:60);if(sc2<bd){bd=sc2;bestTxt=de;bIdeal=okD;}}' +
             '}' +
             'if(bestTxt&&bIdeal)return bestTxt;' +
             'if(qBest)return qBest;' +
@@ -17098,8 +17682,10 @@
               '}' +
             '}' +
           '}' +
+          'var isUrgentClick=Boolean((outMeta&&outMeta.urgentFast)||tCfg.urgentFastClick);' +
+          'var fastZeroMode=Boolean(tCfg.zeroDelay&&!tCfg.holdMs);' +
           'var isOpClean=(tCfg.opClickMode!==false);' +
-          'var autoHOn=(tCfg.autoHumanClick!==false);' +
+          'var autoHOn=!fastZeroMode&&(tCfg.autoHumanClick!==false);' +
           'var hEnv=tCfg.humanEnv||{preMin:5.5,preMax:15,holdMin:16,holdMax:36,postMin:1,postMax:3.5,minFlightMs:125,coordPx:4};' +
           'var tJit=(autoHOn||(!isOpClean&&tCfg.humanJitter))?tPickJitterPoint(doc,primHit||btn||hit,x,y,hEnv.coordPx):{x:Math.round(x),y:Math.round(y),jittered:false};' +
           'x=Math.round(tJit.x);y=Math.round(tJit.y);' +
@@ -17108,13 +17694,12 @@
           'var evY=fpProf?Math.max(1,Number((y+fpProf.dy).toFixed(2))):y;' +
           'var parentEl=hit.parentElement;' +
           'var cleanPreTxt=preBtnTxt.replace(/\\s+/g," ").slice(0,40);' +
-          'var tPreJit=autoHOn?Number(tTriRand(hEnv.preMin||5.5,hEnv.preMax||15).toFixed(2)):0;' +
-          'var tPostJit=autoHOn?Number(tTriRand(hEnv.postMin||1,hEnv.postMax||3.5).toFixed(2)):0;' +
-          'var tAutoHold=autoHOn?Number(tTriRand(hEnv.holdMin||16,hEnv.holdMax||36).toFixed(2)):0;' +
-          'var effHold=autoHOn?Math.max(Number(holdMs)||0,tAutoHold):(holdMs>0?holdMs:0);' +
-          'var tFlightAge=(tRoundFlightAt>0)?Math.max(0,performance.now()-tRoundFlightAt):-1;' +
-          'var tEarlyWait=(autoHOn&&tFlightAge>=0&&tFlightAge<(hEnv.minFlightMs||125))?Math.min(180,Math.round((hEnv.minFlightMs||125)-tFlightAge)):0;' +
-          'var tTotPre=tPreJit+tEarlyWait;' +
+          'var tPreJit=autoHOn?(isUrgentClick?Number(Math.min(1,hEnv.preMin||1).toFixed(2)):Number(tTriRand(hEnv.preMin||5.5,hEnv.preMax||15).toFixed(2))):0;' +
+          'var tPostJit=(autoHOn&&!isUrgentClick)?Number(tTriRand(hEnv.postMin||1,hEnv.postMax||3.5).toFixed(2)):0;' +
+          'var tAutoHold=autoHOn?(isUrgentClick?Number(Math.min(2,Math.max(1,hEnv.holdMin||1.5)).toFixed(2)):Number(tTriRand(hEnv.holdMin||16,hEnv.holdMax||36).toFixed(2))):0;' +
+          'var effHold=fastZeroMode?(Number(holdMs)||0):(isUrgentClick?Math.min(2,Math.max(Number(holdMs)||0,tAutoHold)):(autoHOn?Math.max(Number(holdMs)||0,tAutoHold):(holdMs>0?holdMs:0)));' +
+          'var tEarlyWait=0;' +
+          'var tTotPre=tPreJit;' +
           'var tHumanSpan=Number((tTotPre+effHold+tPostJit).toFixed(2));' +
           'if(outMeta){outMeta._el=btn||hit;outMeta.preText=cleanPreTxt;outMeta.disabled=preBtnDis;outMeta.tag=btn?btn.tagName:"";outMeta.clickX=evX;outMeta.clickY=evY;outMeta.jittered=Boolean(tJit.jittered);outMeta.fpSalt=fpProf?fpProf.salt:"";outMeta.fpPressure=fpProf?fpProf.pr:0;outMeta.fpRadius=fpProf?fpProf.rx:0;outMeta.humanSpanMs=tHumanSpan;outMeta.dryRun=(tCfg.clickEnabled===false);}' +
           'else if(CM_SYM){try{defHide(window,CM_SYM,{preText:cleanPreTxt,disabled:preBtnDis,tag:btn?btn.tagName:"",clickX:evX,clickY:evY,jittered:Boolean(tJit.jittered),fpSalt:fpProf?fpProf.salt:"",fpPressure:fpProf?fpProf.pr:0,fpRadius:fpProf?fpProf.rx:0,humanSpanMs:tHumanSpan,dryRun:(tCfg.clickEnabled===false)});}catch(e){}}' +
@@ -17181,8 +17766,8 @@
                   'if(ME){try{clickOk=live.dispatchEvent(new ME("click",Object.assign({},baseOpts,{buttons:0})));}catch(e2){}}' +
                 '}' +
                 'var postClkEnded=Boolean(tOutCashSeq>preOcUp||(liveBtn&&checkTBtnEnded(liveBtn)));' +
-                'var needsNative=!postClkEnded&&liveBtn&&liveBtn.tagName!=="CANVAS"&&(!clickOk||!insideBtn||live!==liveBtn||tOutCashSeq<=preOcUp||(liveBtn.tagName!=="BUTTON"&&liveBtn.tagName!=="INPUT"));' +
-                'if(needsNative){if(typeof liveBtn.click==="function"){try{liveBtn.click();}catch(e){}}if(tOutCashSeq<=preOcUp&&!checkTBtnEnded(liveBtn)){try{var rks=Object.keys(liveBtn);for(var ri=0;ri<rks.length;ri++){if(rks[ri].indexOf("__reactProps$")===0||rks[ri].indexOf("__reactEventHandlers$")===0){var rp=liveBtn[rks[ri]];if(rp&&typeof rp.onClick==="function"&&!liveBtn.disabled){rp.onClick({type:"click",target:liveBtn,currentTarget:liveBtn,bubbles:true,cancelable:true,isTrusted:true,nativeEvent:{},preventDefault:function(){},stopPropagation:function(){},persist:function(){}});break;}}}}catch(re){}}}' +
+                'var needsNative=!postClkEnded&&liveBtn&&liveBtn.tagName!=="CANVAS"&&(!clickOk||!insideBtn||live!==liveBtn||(liveBtn.tagName!=="BUTTON"&&liveBtn.tagName!=="INPUT"));' +
+                'if(needsNative){if(typeof liveBtn.click==="function"){try{liveBtn.click();}catch(e){}}if(tOutCashSeq<=preOcUp&&!checkTBtnEnded(liveBtn)){try{var rW=liveBtn;for(var rw=0;rw<4&&rW&&tOutCashSeq<=preOcUp;rw++){var rks=Object.keys(rW),rDone=false;for(var ri=0;ri<rks.length;ri++){if(rks[ri].indexOf("__reactProps$")===0||rks[ri].indexOf("__reactEventHandlers$")===0){var rp=rW[rks[ri]];var synE={type:"click",target:liveBtn,currentTarget:rW,bubbles:true,cancelable:true,isTrusted:true,nativeEvent:{},preventDefault:function(){},stopPropagation:function(){},persist:function(){}};if(rp&&typeof rp.onClick==="function"&&!rW.disabled){rp.onClick(synE);rDone=true;break;}if(rp&&typeof rp.onPointerUp==="function"&&!rW.disabled){rp.onPointerUp(Object.assign({},synE,{type:"pointerup"}));rDone=true;break;}if(rp&&typeof rp.onMouseUp==="function"&&!rW.disabled){rp.onMouseUp(Object.assign({},synE,{type:"mouseup"}));rDone=true;break;}}}if(rDone||tOutCashSeq>preOcUp)break;rW=rW.parentElement;}}catch(re){}}}' +
               '}' +
               'if(PE){try{live.dispatchEvent(new PE("pointerout",Object.assign({},moveOpts,ptrBase,{buttons:0,pressure:0})));}catch(e){}' +
               'try{live.dispatchEvent(new PE("pointerleave",Object.assign({},moveOpts,ptrBase,{bubbles:false,buttons:0,pressure:0})));}catch(e){}' +
@@ -17246,7 +17831,7 @@
             'lastTurboAt=nowMs;if(tCfg.roundOnce){roundClickLocked=true;roundClickLockedAt=nowMs;roundSawFlight=false;roundSawCrash=false;roundLastFlightAt=0;roundLockedId=pktRoundId;}var wasOS=Boolean(tCfg.oneShot);if(wasOS)tCfg.armed=false;' +
             'return {tag:mTag,t0:t0,roundId:pktRoundId,remoteOnly:true,remoteToken:rToken,gateId:gSt?gSt.id:0,timeStr:tFmtMs(),oneShotFired:wasOS};' +
           '}' +
-          'var meta={},clickLockAdded=false;' +
+          'var meta={urgentFast:true},clickLockAdded=false;' +
           'var pPreHold=Math.round((tCfg.autoHumanClick!==false&&tCfg.humanEnv)?((tCfg.humanEnv.preMax||15)+(tCfg.humanEnv.holdMax||36)+(tCfg.humanEnv.postMax||3.5)):0);' +
           'if((cHold>0||pPreHold>0)&&gSt&&typeof lockFrame==="function"){lockFrame(gSt,Math.max(cHold+pPreHold+cGate+cLead+120,180));clickLockAdded=true;}' +
           'var clickReleased=false,clickDoneAt=0;' +
@@ -17261,7 +17846,7 @@
           'var isWrongBtn=Boolean(tCfg.clickEnabled!==false&&!meta.dryRun&&(meta.btnWrong||tIsWrongBtnState(meta.preText,meta.disabled,meta.btnEl)));' +
           'if(isWrongBtn&&!isRetryCall){' +
             'if(!clickReleased){clickReleased=true;if(clickLockAdded&&typeof unlockFrame==="function")unlockFrame(gTgt,gSt,0);}' +
-            'tClearRetry();var rTries=38,tRetryBusy=false,tCachedBtn=(meta._el&&meta._el.isConnected)?meta._el:((meta.btnEl&&meta.btnEl.isConnected)?meta.btnEl:null);' +
+            'tClearRetry();var rTries=64,tRetryBusy=false,tCachedBtn=(meta._el&&meta._el.isConnected)?meta._el:((meta.btnEl&&meta.btnEl.isConnected)?meta.btnEl:null);' +
             'tEmitRetryDepth(1,"PAGE_BTN_OFF");' +
             'var isPageBtnReady=function(rb){if(!rb||!rb.isConnected)return false;var rDis=Boolean(rb.disabled||(rb.getAttribute&&rb.getAttribute("aria-disabled")==="true"));if(rDis)return false;var rTxt=(rb.textContent||rb.value||"").trim();return !tIsWrongBtnState(rTxt,false,rb);};' +
             'var doRetry=function(){' +
@@ -17274,14 +17859,14 @@
                 'var rb=(tCachedBtn&&tCachedBtn.isConnected)?tCachedBtn:null;' +
                 'if(!rb){var rh=deepEl(document,fireX,fireY,true);rb=(rh&&rh.closest)?(rh.closest("button,a,[role=button],input[type=button],input[type=submit]")||rh):rh;if(rb&&rb.isConnected)tCachedBtn=rb;}' +
                 'if(isPageBtnReady(rb)){var rr=rb.getBoundingClientRect();var rCtx={roundId:pktRoundId};if(rr&&rr.width>2&&rr.height>2){rCtx.overrideX=Math.round(rr.left+rr.width/2);rCtx.overrideY=Math.round(rr.top+rr.height/2);}var retR=fireTurboClick(mTag,performance.now(),rCtx,true);if(retR&&!retR.wrongBtn){tClearRetry();return;}}' +
-                'if(rTries>0){tRetryTimer=setTimeout(doRetry,16);}' +
+                'if(rTries>0){tRetryTimer=setTimeout(doRetry,rTries>48?2:6);}' +
                 'else tClearRetry();' +
               '}finally{tRetryBusy=false;}' +
             '};' +
             'if(typeof MutationObserver==="function"&&tCachedBtn){' +
               'try{tRetryObs=new MutationObserver(function(){if(tRetryBusy||!tCfg.armed||roundClickLocked||activeClickCount>0)return;if(isPageBtnReady(tCachedBtn)){if(tRetryTimer){clearTimeout(tRetryTimer);tRetryTimer=0;}tRetryTimer=setTimeout(doRetry,0);}});var pAttrs=["disabled","aria-disabled","data-disabled","class","data-state","data-status"];tRetryObs.observe(tCachedBtn,{attributes:true,attributeFilter:pAttrs,subtree:false});if(tCachedBtn.parentElement&&tCachedBtn.parentElement.id!==HUD_ID)tRetryObs.observe(tCachedBtn.parentElement,{attributes:true,attributeFilter:pAttrs,subtree:false});}catch(emo){}' +
             '}' +
-            'tRetryTimer=setTimeout(doRetry,16);' +
+            'tRetryTimer=setTimeout(doRetry,2);' +
             'var pNowD=clickDoneAt||performance.now();' +
             'return {tag:mTag,t0:t0,roundId:pktRoundId,tClick:pNowD,elapsed:(pNowD-t0).toFixed(2),timeStr:tFmtMs(),preText:meta.preText||"",preDis:true,wrongBtn:true,oneShotFired:false,fromLocalIframe:Boolean(tCfg.hudHidden&&hasLocal)};' +
           '}' +
@@ -17347,7 +17932,7 @@
             'globalClickUntil=Math.max(globalClickUntil,cmdNow+(Number(d.holdMs)||0)+Math.max(Number(tCfg.gateMs)||0,Number(tCfg.leadMs)||0,tCfg.preClickGate?2:0));' +
             'lastClickDoneAt=cmdNow;' +
             'if(typeof tightenCrashHolds==="function")tightenCrashHolds(globalClickUntil);' +
-            'var ackMeta={};' +
+            'var ackMeta={urgentFast:Boolean(d.urgentFast||tCfg.urgentFastClick)};' +
             'var ok=fireAt(document,window,d.x,d.y,d.holdMs||0,d.fast!==false,ackMeta);' +
             'defHide(window,"__ttPageClickDone",ok);' +
             'if(ok&&CD_SYM)defHide(window,CD_SYM,true);' +
@@ -17375,7 +17960,7 @@
             'if(ws.readyState===1)window.__ttLiveGameWs=ws;' +
             'if(typeof raw==="string"){' +
               'var lc=raw.toLowerCase();' +
-              'if(lc.indexOf("cashout")!==-1||lc.indexOf("cash_out")!==-1||lc.indexOf("takewin")!==-1||lc.indexOf("collect")!==-1||lc.indexOf("claim")!==-1||lc.indexOf("settle")!==-1||lc.indexOf("sell")!==-1){' +
+              'if(lc.indexOf("cashout")!==-1||lc.indexOf("cash_out")!==-1||lc.indexOf("takewin")!==-1||lc.indexOf("collect")!==-1||lc.indexOf("claim")!==-1||lc.indexOf("settle")!==-1||lc.indexOf("sell")!==-1||lc.indexOf("decision")!==-1||lc.indexOf("hf_cashout")!==-1||lc.indexOf("stop_flight")!==-1){' +
                 'tOutCashSeq++;tLastOutCashAt=Date.now();' +
                 'try{document.dispatchEvent(new CustomEvent("__TT_PAGE_OUT_CASH__"));}catch(eoc){}' +
                 'var tplObj={ws:ws,raw:raw,ts:tLastOutCashAt};' +
@@ -17389,27 +17974,50 @@
           'try{' +
             'if(tCfg.clickEnabled===false||tCfg.directWsCashout===false)return;' +
             'var nowD=Date.now();' +
-            'if(tRoundSawCrash||(nowD-tLastRoundCrashAt<4000)||(nowD-tLastOutCashAt<1500)||(nowD-tLastCashAckAt<2500))return;' +
-            'if(nowD-(window.__ttLastDirectCashAt||0)<1500)return;' +
+            'var det=ev&&ev.detail;if(typeof det==="string"){try{det=JSON.parse(det);}catch(ep){det={};}}' +
+            'var minCooldown=(det&&det.urgent)?600:1500;' +
+            'if(tRoundSawCrash||(nowD-tLastRoundCrashAt<4000)||(nowD-tLastOutCashAt<minCooldown)||(nowD-tLastCashAckAt<2500))return;' +
+            'if(nowD-(window.__ttLastDirectCashAt||0)<minCooldown)return;' +
             'var tpl=window.__ttLastOutCashTpl;' +
             'if(!tpl||!tpl.raw){try{var lsTpl=localStorage.getItem("__tt_outcash_tpl");if(lsTpl){var prs=JSON.parse(lsTpl);if(prs&&prs.raw)tpl={ws:window.__ttLiveGameWs||null,raw:prs.raw,ts:prs.ts||0};}}catch(erls){}}' +
-            'if(!tpl||!tpl.raw||typeof tpl.raw!=="string")return;' +
-            'var ws=(tpl.ws&&tpl.ws.readyState===1)?tpl.ws:((window.__ttLiveGameWs&&window.__ttLiveGameWs.readyState===1)?window.__ttLiveGameWs:null);' +
-            'if(!ws)return;' +
-            'var det=ev&&ev.detail;if(typeof det==="string"){try{det=JSON.parse(det);}catch(ep){det={};}}' +
-            'var outStr=tpl.raw;' +
-            'var tplHasBetId=outStr.indexOf("betId")!==-1||outStr.indexOf("bet_id")!==-1||outStr.indexOf("ticketId")!==-1||outStr.indexOf("orderId")!==-1;' +
-            'if(tplHasBetId&&det&&det.betId){' +
-              'var sBid=String(det.betId).replace(/"/g,"");' +
-              'outStr=outStr.replace(/("(?:bet|ticket|order)(?:Id|_id)"\\s*:\\s*)(?:"[^"]*"|\\d+)/gi,function(_m,p){return p+(/^\\d+$/.test(sBid)?sBid:JSON.stringify(sBid));});' +
-            '}else if(tplHasBetId&&(nowD-(tpl.ts||0)>15000)){return;}' +
-            'if(det&&det.roundId){' +
-              'var sRid=String(det.roundId).replace(/"/g,"");' +
-              'outStr=outStr.replace(/("round(?:Id|_id)"\\s*:\\s*)(?:"[^"]*"|\\d+)/gi,function(_m,p){return p+(/^\\d+$/.test(sRid)?sRid:JSON.stringify(sRid));});' +
+            'var ws=(tpl&&tpl.ws&&tpl.ws.readyState===1)?tpl.ws:((window.__ttLiveGameWs&&window.__ttLiveGameWs.readyState===1)?window.__ttLiveGameWs:null);' +
+            'if(tpl&&tpl.raw&&typeof tpl.raw==="string"&&ws){' +
+              'var outStr=tpl.raw;' +
+              'var tplHasBetId=outStr.indexOf("betId")!==-1||outStr.indexOf("bet_id")!==-1||outStr.indexOf("ticketId")!==-1||outStr.indexOf("orderId")!==-1;' +
+              'if(tplHasBetId&&det&&det.betId){' +
+                'var sBid=String(det.betId).replace(/"/g,"");' +
+                'outStr=outStr.replace(/("(?:bet|ticket|order)(?:Id|_id)"\\s*:\\s*)(?:"[^"]*"|\\d+)/gi,function(_m,p){return p+(/^\\d+$/.test(sBid)?sBid:JSON.stringify(sBid));});' +
+              '}else if(tplHasBetId&&(nowD-(tpl.ts||0)>15000)){tpl=null;}' +
+              'if(tpl){' +
+                'if(det&&det.roundId){' +
+                  'var sRid=String(det.roundId).replace(/"/g,"");' +
+                  'outStr=outStr.replace(/("round(?:Id|_id)"\\s*:\\s*)(?:"[^"]*"|\\d+)/gi,function(_m,p){return p+(/^\\d+$/.test(sRid)?sRid:JSON.stringify(sRid));});' +
+                '}' +
+                'window.__ttLastDirectCashAt=nowD;tOutCashSeq++;tLastOutCashAt=nowD;' +
+                'try{document.dispatchEvent(new CustomEvent("__TT_PAGE_OUT_CASH__"));}catch(eoc2){}' +
+                'ws.send(outStr);' +
+                'return;' +
+              '}' +
             '}' +
-            'window.__ttLastDirectCashAt=nowD;tOutCashSeq++;tLastOutCashAt=nowD;' +
-            'try{document.dispatchEvent(new CustomEvent("__TT_PAGE_OUT_CASH__"));}catch(eoc2){}' +
-            'ws.send(outStr);' +
+            'var hTpl=window.__ttLastHttpOutCashTpl;' +
+            'if(hTpl&&hTpl.url&&(nowD-(hTpl.ts||0)<=300000)&&typeof of==="function"){' +
+              'var hBody=typeof hTpl.body==="string"?hTpl.body:"";' +
+              'var hHasBid=hBody.indexOf("betId")!==-1||hBody.indexOf("bet_id")!==-1||hBody.indexOf("ticketId")!==-1||hBody.indexOf("orderId")!==-1;' +
+              'if(hHasBid&&det&&det.betId){' +
+                'var hBid=String(det.betId).replace(/"/g,"");' +
+                'hBody=hBody.replace(/("(?:bet|ticket|order)(?:Id|_id)"\\s*:\\s*)(?:"[^"]*"|\\d+)/gi,function(_m,p){return p+(/^\\d+$/.test(hBid)?hBid:JSON.stringify(hBid));});' +
+              '}else if(hHasBid&&(nowD-(hTpl.ts||0)>15000)){return;}' +
+              'if(det&&det.roundId&&hBody){' +
+                'var hRid=String(det.roundId).replace(/"/g,"");' +
+                'hBody=hBody.replace(/("round(?:Id|_id)"\\s*:\\s*)(?:"[^"]*"|\\d+)/gi,function(_m,p){return p+(/^\\d+$/.test(hRid)?hRid:JSON.stringify(hRid));});' +
+              '}' +
+              'window.__ttLastDirectCashAt=nowD;tOutCashSeq++;tLastOutCashAt=nowD;' +
+              'try{document.dispatchEvent(new CustomEvent("__TT_PAGE_OUT_CASH__"));}catch(eoc3){}' +
+              'var fOpts={method:hTpl.method||"POST",credentials:"include"};' +
+              'if(hTpl.headers)fOpts.headers=hTpl.headers;' +
+              'if(hBody)fOpts.body=hBody;' +
+              'of.call(window,hTpl.url,fOpts).catch(function(){});' +
+            '}' +
           '}catch(ed){}' +
         '}' +
         'document.addEventListener("__TT_PAGE_CASH_ACK__",function(){tLastCashAckAt=Date.now();});' +
@@ -17534,7 +18142,7 @@
                   'if(typeof v==="string"&&T_GFIELD[lk]){' +
                     'var sv=v.trim().toLowerCase();' +
                     'if(T_CRASH_V[sv])hasC=true;else if(T_FLIGHT_V[sv])hasF=true;else if(T_START_V[sv])hasS=true;' +
-                  '}else if(lk==="coef"||lk==="coeff"||lk==="coefficient"||lk==="multiplier"||lk==="mult"||lk==="mul"||lk==="odds"||lk==="rate"){var mv=tParseNum(v);if(!isNaN(mv)&&mv>1.005&&mv<1000000)hasF=true;}' +
+                  '}else if(lk==="coef"||lk==="coeff"||lk==="coefficient"||lk==="multiplier"||lk==="mult"||lk==="mul"||lk==="odds"||lk==="rate"){var mv=tParseNum(v);if(!isNaN(mv)&&mv>1.001&&mv<1000000)hasF=true;}' +
                   'else if(v&&typeof v==="object"){walkG(v,dp+1);}' +
                   'else if(typeof v==="string"&&dp<3&&(v.charAt(0)==="{"||v.charAt(0)==="[")){walkG(v,dp+1);}' +
                 '}' +
@@ -17704,10 +18312,10 @@
           'sq.scheduled=false;' +
           'if(sq.timerId){clearTimeout(sq.timerId);sq.timerId=0;}' +
           'var now=performance.now();' +
-          'if(globalClickUntil>now+480)globalClickUntil=now+480;' +
+          'if(globalClickUntil>now+60)globalClickUntil=now+60;' +
           'while(sq.items.length){' +
             'var head=sq.items[0];' +
-            'var forceStale=(sq.items.length>16||(now-head.t0)>=120);' +
+            'var forceStale=(sq.items.length>3||(now-head.t0)>=35);' +
             'if(!forceStale){' +
               'if(activeClickCount>0||pendingRemoteCount>0){' +
                 'schedSq(tgt,sq,2);' +
@@ -17775,11 +18383,11 @@
           'var hasInsp=Boolean(tInsp.enabled&&(tInsp.kws.length||tInsp.rxs.length||tInsp.jps.length));' +
           'var holdAllMs=(!isHb&&tCfg.inspectorEnabled&&tCfg.inspectorHoldAllWs&&iMs>0)?iMs:0;' +
           'var autoHoldArmed=Boolean(!isHb&&tCfg.inspectorEnabled&&tCfg.inspectorAutoClick&&tCfg.armed);' +
-          'var inspGateActive=Boolean(!isHb&&hasInsp&&iMs>0&&(tCfg.armed||holdAllMs>0||autoHoldArmed));' +
+          'var inspGateActive=Boolean(!isHb&&hasInsp&&iMs>0&&(holdAllMs>0||autoHoldArmed));' +
           'var sq=getStreamEntry(tgt);' +
           'var hasPendingQ=Boolean(!isHb&&sq&&sq.items.length>0);' +
           'var armOrRecent=Boolean(!isHb&&(tCfg.armed||globalClickUntil>t0||activeClickCount>0||pendingRemoteCount>0));' +
-          'var gateArmActive=Boolean(armOrRecent&&(preGateOn||gMs>0||lMs>0));' +
+          'var gateArmActive=Boolean(armOrRecent&&preGateOn);' +
           'var activeGate=Boolean(gateArmActive||hasPendingQ||inspGateActive||holdAllMs>0||autoHoldArmed);' +
           'var kind=streamKindOf(tgt);' +
           'var isBl=(!isHb&&typeof Blob!=="undefined"&&ev.data instanceof Blob);' +
@@ -17833,7 +18441,7 @@
                 'var relAt=Math.max(st.ownRelAt,(hasPendingQ?prevRel:0));' +
                 'if(gateArmActive&&(st.isCrash||clickBusy))relAt=Math.max(relAt,globalClickUntil);' +
                 'if(inspHitTag){var hitTb=fireTurboClick(inspHitTag,t0,gCtx);if(hitTb)tb=hitTb;}' +
-                'var bypassQueueFast=Boolean(zDelay&&!st.isMatch&&!st.isCrash&&!syncInspHeldMs&&!hasPendingQ&&activeClickCount===0&&pendingRemoteCount===0);' +
+                'var bypassQueueFast=Boolean(!st.isMatch&&!st.isCrash&&!syncInspHeldMs&&!hasPendingQ&&activeClickCount===0&&pendingRemoteCount===0);' +
                 'var mustQueue=!bypassQueueFast&&Boolean(hasPendingQ||relAt>now||st.lockCount>1||activeClickCount>0||pendingRemoteCount>0||(st.isMatch&&(st.isCrash||effHold>0||gMs>0)));' +
                 'if(mustQueue){' +
                   'enqueueFrame(tgt,sq,st,Math.max(relAt,now+(baseDelay>0?baseDelay:1)));' +
@@ -17859,7 +18467,7 @@
             'var aUrl=kind==="message"?(tgt.url||""):"";' +
             'var aKind=kind==="worker"?"worker":(kind==="rtc"?"rtc":(kind==="sse"?"sse":"message"));' +
             'var hasClickBusyA=Boolean(activeClickCount>0||pendingRemoteCount>0||globalClickUntil>t0);' +
-            'var holdAsync=Boolean(!isHb&&(hasPendingQ||hasClickBusyA||holdAllMs>0||inspGateActive||autoHoldArmed||(!zDelay&&(effHold>0||preGateOn||(tCfg.armed&&(gMs>0||lMs>0))))));' +
+            'var holdAsync=Boolean(!isHb&&(hasPendingQ||hasClickBusyA||holdAllMs>0||inspGateActive||autoHoldArmed||preGateOn||(gateArmActive&&!zDelay)));' +
             'if(holdAsync){' +
               'var nowA=performance.now();' +
               'st.pendingAsync=true;' +
@@ -18047,10 +18655,10 @@
             'if(isRelay(u)||isStaticUrl(u))return of.apply(fRecv,arguments);' +
             'var m=String((ini&&ini.method)||(inp&&inp.method)||"GET").toUpperCase();' +
             'var mr=m+" "+u+"\\n";' +
-            'var checkOutHttp=function(urlStr,bodyVal){try{var chk=(String(urlStr||"")+" "+(typeof bodyVal==="string"?bodyVal:"")).toLowerCase();if(chk.indexOf("cashout")!==-1||chk.indexOf("cash_out")!==-1||chk.indexOf("takewin")!==-1||chk.indexOf("collect")!==-1||chk.indexOf("claim")!==-1||chk.indexOf("settle")!==-1){tOutCashSeq++;tLastOutCashAt=Date.now();document.dispatchEvent(new CustomEvent("__TT_PAGE_OUT_CASH__"));}}catch(eoh){}};' +
-            'try{if(ini&&ini.body!=null){checkOutHttp(u,ini.body);emitSafe("__TT_PAGE_API__",{src:"API-REQ",meta:mr},ini.body);}' +
-            'else if(typeof Request!=="undefined"&&inp instanceof Request&&inp.body&&!inp.bodyUsed&&m!=="GET"&&m!=="HEAD"){try{inp.clone().text().then(function(rt){checkOutHttp(u,rt);emitSafe("__TT_PAGE_API__",{src:"API-REQ",meta:mr},(rt&&rt.length>65536)?rt.slice(0,65536):(rt||""));}).catch(function(){checkOutHttp(u,"");emitSafe("__TT_PAGE_API__",{src:"API-REQ",meta:mr},"");});}catch(er){checkOutHttp(u,"");emitSafe("__TT_PAGE_API__",{src:"API-REQ",meta:mr},"");}}' +
-            'else{if(m!=="GET")checkOutHttp(u,"");emitSafe("__TT_PAGE_API__",{src:"API-REQ",meta:mr},"");}}catch(e){}' +
+            'var checkOutHttp=function(urlStr,bodyVal,hdrs){try{var chk=(String(urlStr||"")+" "+(typeof bodyVal==="string"?bodyVal:"")).toLowerCase();if(chk.indexOf("cashout")!==-1||chk.indexOf("cash_out")!==-1||chk.indexOf("takewin")!==-1||chk.indexOf("collect")!==-1||chk.indexOf("claim")!==-1||chk.indexOf("settle")!==-1||chk.indexOf("decision")!==-1||chk.indexOf("stop_flight")!==-1){tOutCashSeq++;tLastOutCashAt=Date.now();window.__ttLastHttpOutCashTpl={kind:"fetch",url:String(urlStr||""),method:m||"POST",headers:hdrs||null,body:typeof bodyVal==="string"?bodyVal:"",ts:tLastOutCashAt};document.dispatchEvent(new CustomEvent("__TT_PAGE_OUT_CASH__"));}}catch(eoh){}};' +
+            'try{var fHdrs=null;if(ini&&ini.headers){try{if(ini.headers instanceof Headers){fHdrs={};ini.headers.forEach(function(hv,hk){fHdrs[hk]=hv;});}else if(typeof ini.headers==="object"){fHdrs=Object.assign({},ini.headers);}}catch(ehd){}}if(ini&&ini.body!=null){checkOutHttp(u,ini.body,fHdrs);emitSafe("__TT_PAGE_API__",{src:"API-REQ",meta:mr},ini.body);}' +
+            'else if(typeof Request!=="undefined"&&inp instanceof Request&&inp.body&&!inp.bodyUsed&&m!=="GET"&&m!=="HEAD"){try{inp.clone().text().then(function(rt){checkOutHttp(u,rt,fHdrs);emitSafe("__TT_PAGE_API__",{src:"API-REQ",meta:mr},(rt&&rt.length>65536)?rt.slice(0,65536):(rt||""));}).catch(function(){checkOutHttp(u,"",fHdrs);emitSafe("__TT_PAGE_API__",{src:"API-REQ",meta:mr},"");});}catch(er){checkOutHttp(u,"",fHdrs);emitSafe("__TT_PAGE_API__",{src:"API-REQ",meta:mr},"");}}' +
+            'else{if(m!=="GET")checkOutHttp(u,"",fHdrs);emitSafe("__TT_PAGE_API__",{src:"API-REQ",meta:mr},"");}}catch(e){}' +
             'return of.apply(fRecv,arguments).then(function(res){' +
               'try{' +
                 'if(seenRes&&res)seenRes.add(res);' +
@@ -18071,7 +18679,7 @@
             'xp.open=maskNative(function open(m,u){defHide(this,"__ttM",String(m||"GET").toUpperCase());defHide(this,"__ttU",String(u||""));return xo.apply(this,arguments);},xo);' +
             'xp.send=maskNative(function send(b){var x=this;if(isRelay(x.__ttU)||isStaticUrl(x.__ttU))return xs.apply(this,arguments);' +
               'var mr=(x.__ttM||"GET")+" "+(x.__ttU||"")+"\\n";' +
-              'try{var xChk=(String(x.__ttU||"")+" "+(typeof b==="string"?b:"")).toLowerCase();if((x.__ttM&&x.__ttM!=="GET")&&(xChk.indexOf("cashout")!==-1||xChk.indexOf("cash_out")!==-1||xChk.indexOf("takewin")!==-1||xChk.indexOf("collect")!==-1||xChk.indexOf("claim")!==-1||xChk.indexOf("settle")!==-1)){tOutCashSeq++;tLastOutCashAt=Date.now();document.dispatchEvent(new CustomEvent("__TT_PAGE_OUT_CASH__"));}emitSafe("__TT_PAGE_API__",{src:"API-REQ",meta:mr},b!=null?b:"");}catch(e){}' +
+              'try{var xChk=(String(x.__ttU||"")+" "+(typeof b==="string"?b:"")).toLowerCase();if((x.__ttM&&x.__ttM!=="GET")&&(xChk.indexOf("cashout")!==-1||xChk.indexOf("cash_out")!==-1||xChk.indexOf("takewin")!==-1||xChk.indexOf("collect")!==-1||xChk.indexOf("claim")!==-1||xChk.indexOf("settle")!==-1||xChk.indexOf("decision")!==-1||xChk.indexOf("stop_flight")!==-1)){tOutCashSeq++;tLastOutCashAt=Date.now();window.__ttLastHttpOutCashTpl={kind:"xhr",url:String(x.__ttU||""),method:String(x.__ttM||"POST"),headers:null,body:typeof b==="string"?b:"",ts:tLastOutCashAt};document.dispatchEvent(new CustomEvent("__TT_PAGE_OUT_CASH__"));}emitSafe("__TT_PAGE_API__",{src:"API-REQ",meta:mr},b!=null?b:"");}catch(e){}' +
               'if(!x.__ttPagePX){defHide(x,"__ttPagePX",true);x.addEventListener("load",function(){try{var ct=x.getResponseHeader?x.getResponseHeader("content-type"):"";var rUrl=x.responseURL||x.__ttU||"";if(isStaticMedia(ct)||isStaticUrl(rUrl))return;var ms=x.status+" "+(x.__ttM||"")+" "+rUrl+"\\n";var d=(x.responseType==="arraybuffer"||x.responseType==="blob"||x.responseType==="json")?x.response:x.responseText;if(d!=null&&d!==""){if(typeof d==="string"&&d.length>98304){if(!tCfg.armed)return;d=d.slice(0,98304);}else if((d instanceof ArrayBuffer||ArrayBuffer.isView(d))&&(d.byteLength||0)>98304)return;else if(typeof Blob!=="undefined"&&d instanceof Blob&&d.size>98304)return;var strOrBuf=typeof d==="object"&&!(d instanceof ArrayBuffer)&&!ArrayBuffer.isView(d)&&!(typeof Blob!=="undefined"&&d instanceof Blob)?JSON.stringify(d):d;if(typeof strOrBuf==="string"&&strOrBuf.length>98304){if(!tCfg.armed)return;strOrBuf=strOrBuf.slice(0,98304);}var t0=performance.now();var tb=runTurboRaw(strOrBuf,t0,null,null,ms);emitSafe("__TT_PAGE_API__",tb?{src:"API-RES",meta:ms,turbo:tb}:{src:"API-RES",meta:ms},strOrBuf);}}catch(e){}});}' +
               'return xs.apply(this,arguments);' +
             '},xs);' +
@@ -18205,7 +18813,7 @@
                 'if(tCfg.listenRTF!==false&&tCfg.listenJS!==false&&(!tCfg.hudHidden||tCfg.armed)&&ev&&typeof ev.type==="string"){' +
                   'var et=ev.type;' +
                   'if(et.indexOf("__TT_")!==0&&et.indexOf("__triggertap")!==0&&!rtfNoiseEv[et]){' +
-                    'var nowEt=Date.now();var minGapEt=(tCfg.armed&&tEntries.length)?20:45;' +
+                    'var nowEt=Date.now();var minGapEt=(tCfg.armed&&tEntries.length)?80:140;' +
                     'if(!rtfTypeLast[et]||nowEt-rtfTypeLast[et]>=minGapEt){' +
                       'rtfTypeLast[et]=nowEt;' +
                       'var isCust=(typeof CustomEvent!=="undefined"&&ev instanceof CustomEvent)||("detail" in ev);' +
@@ -18863,7 +19471,7 @@
           if (wasOS) CFG.armed = true;
           if (!isRetryCall) {
             clearPendingTargetRetry();
-            let fbRt = 38;
+            let fbRt = 64;
             let fbRtBusy = false;
             let fbRetryBtnRef = (lastDomClickEl && lastDomClickEl.isConnected && !isOwnHudNode(lastDomClickEl)) ? lastDomClickEl : null;
             emitRetryQueueDepth(1, 'FB_BTN_OFF');
@@ -18901,14 +19509,14 @@
                   const res = fbTurboFromText(rawText, performance.now(), null, true);
                   if (!res || res.preDis || res.wrongBtn) {
                     if (res && (res.preDis || res.wrongBtn)) roundClickLocked = false;
-                    if (fbRt > 0) pendingTargetRetryTimer = setTimeout(runFbRt, 16);
+                    if (fbRt > 0) pendingTargetRetryTimer = setTimeout(runFbRt, fbRt > 48 ? 2 : 6);
                     else clearPendingTargetRetry();
                   } else {
                     clearPendingTargetRetry();
                   }
                   return;
                 }
-                if (fbRt > 0) pendingTargetRetryTimer = setTimeout(runFbRt, 16);
+                if (fbRt > 0) pendingTargetRetryTimer = setTimeout(runFbRt, fbRt > 48 ? 2 : 6);
                 else clearPendingTargetRetry();
               } finally {
                 fbRtBusy = false;
@@ -18932,7 +19540,7 @@
                 }
               } catch {}
             }
-            pendingTargetRetryTimer = setTimeout(runFbRt, 16);
+            pendingTargetRetryTimer = setTimeout(runFbRt, 2);
           }
         } else {
           lastTriggerAt = nowMs;
@@ -19139,10 +19747,10 @@
         sq.scheduled = false;
         if (sq.timerId) { clearTimeout(sq.timerId); sq.timerId = 0; }
         let now = performance.now();
-        if (fbGlobalClickUntil > now + 480) fbGlobalClickUntil = now + 480;
+        if (fbGlobalClickUntil > now + 60) fbGlobalClickUntil = now + 60;
         while (sq.items.length) {
           const head = sq.items[0];
-          const forceStale = sq.items.length > 16 || (now - head.t0) >= 120;
+          const forceStale = sq.items.length > 3 || (now - head.t0) >= 35;
           if (!forceStale) {
             if (fbActiveClickCount > 0 || fbPendingRemoteCount > 0) {
               schedFbSq(tgt, sq, 2);
@@ -19213,11 +19821,11 @@
         const hasInsp = Boolean(compInsp.enabled && (compInsp.kws.length || compInsp.rxs.length || compInsp.jps.length));
         const fbHoldAllMs = (!isHb && CFG.inspectorEnabled && CFG.inspectorHoldAllWs && iMs > 0) ? iMs : 0;
         const fbAutoHoldArmed = Boolean(!isHb && CFG.inspectorEnabled && CFG.inspectorAutoClick && CFG.armed);
-        const fbInspGateActive = Boolean(!isHb && hasInsp && iMs > 0 && (CFG.armed || fbHoldAllMs > 0 || fbAutoHoldArmed));
+        const fbInspGateActive = Boolean(!isHb && hasInsp && iMs > 0 && (fbHoldAllMs > 0 || fbAutoHoldArmed));
         const sq = getFbSq(tgt);
         const hasPendingQ = Boolean(!isHb && sq && sq.items.length > 0);
         const armOrRecent = Boolean(!isHb && (CFG.armed || fbGlobalClickUntil > t0 || fbActiveClickCount > 0 || fbPendingRemoteCount > 0));
-        const gateArmActive = Boolean(armOrRecent && (preGateOn || gMs > 0 || lMs > 0));
+        const gateArmActive = Boolean(armOrRecent && preGateOn);
         const activeGate = Boolean(gateArmActive || hasPendingQ || fbInspGateActive || fbHoldAllMs > 0 || fbAutoHoldArmed);
         const isBl = (!isHb && typeof Blob !== 'undefined' && ev.data instanceof Blob);
         const gz = (!isBl && !isHb) ? getFbGzInfo(ev.data) : null;
@@ -19289,7 +19897,7 @@
                 const postH = (preGateOn || gMs > 0 || lMs > 0) ? Math.max(gMs, lMs, 2) : 0;
                 fireTargetClick('WS-IN[' + fbInspHitTag + ']', t0, (ok) => unlockFbFrame(tgt, st, ok ? postH : 0));
               }
-              const fbBypassQ = Boolean(zDelay && !isMatched && !isCrash && !fbInspHeldMs && !hasPendingQ && fbActiveClickCount === 0 && fbPendingRemoteCount === 0);
+              const fbBypassQ = Boolean(!isMatched && !isCrash && !fbInspHeldMs && !hasPendingQ && fbActiveClickCount === 0 && fbPendingRemoteCount === 0);
               const mustQueue = !fbBypassQ && Boolean(hasPendingQ || relAt > now || st.lockCount > 1 || fbActiveClickCount > 0 || fbPendingRemoteCount > 0 || (isMatched && (isCrash || cHold > 0 || gMs > 0)));
               if (mustQueue) {
                 enqueueFbFrame(tgt, sq, st, Math.max(relAt, now + (baseDelay > 0 ? baseDelay : 1)));
@@ -19308,7 +19916,7 @@
         } else {
           st.asyncHandled = true;
           const fbClickBusyA = Boolean(fbActiveClickCount > 0 || fbPendingRemoteCount > 0 || fbGlobalClickUntil > t0);
-          const holdAsync = Boolean(!isHb && (hasPendingQ || fbClickBusyA || fbHoldAllMs > 0 || fbInspGateActive || fbAutoHoldArmed || (!zDelay && (cHold > 0 || preGateOn || (CFG.armed && (gMs > 0 || lMs > 0))))));
+          const holdAsync = Boolean(!isHb && (hasPendingQ || fbClickBusyA || fbHoldAllMs > 0 || fbInspGateActive || fbAutoHoldArmed || preGateOn || (gateArmActive && !zDelay)));
           if (holdAsync) {
             const nowA = performance.now();
             st.pendingAsync = true;
@@ -20272,6 +20880,8 @@
       if (lastHitTag === 'TEST') lastHitTag = '';
       cancelPredictivePreTrigger('HOTKEY_TOGGLE');
       preTriggerFiredThisRound = false;
+      preSignalFiredThisRound = false;
+      preSignalWindowInfo = null;
       roundClickLocked = false;
       roundSawFlightAfterLock = false;
       roundSawCrashAfterLock = false;
@@ -20483,7 +21093,6 @@
     let changed = false;
     if (sampleSrc === 'WS-IN' && (lc.includes('expected_betting_phase') || lc.includes('"nsp":'))) {
       CFG.decodeBinary = true;
-      CFG.preClickGate = true;
       CFG.roundOnce = true;
       CFG.zeroDelay = true;
       CFG.wsLeadMs = 12;
@@ -20495,7 +21104,6 @@
       autoSiteAppliedOnce = true;
     } else if (h && (h.includes('1xlite') || h.includes('1xbet') || h.includes('spribe') || h.includes('aviator') || h.includes('crash'))) {
       CFG.decodeBinary = true;
-      CFG.preClickGate = true;
       CFG.roundOnce = true;
       CFG.zeroDelay = true;
       CFG.inspectorEnabled = true;
@@ -20514,6 +21122,7 @@
   const destroyFn = function () {
     CFG.armed = false;
     try { if (typeof stopTargetRgbBlink === 'function') stopTargetRgbBlink('DESTROY', true); } catch {}
+    if (toolRbStyleEl && toolRbStyleEl.parentNode) { try { toolRbStyleEl.parentNode.removeChild(toolRbStyleEl); } catch {} toolRbStyleEl = null; }
     if (rgbHaloEl && rgbHaloEl.parentNode) { try { rgbHaloEl.parentNode.removeChild(rgbHaloEl); } catch {} rgbHaloEl = null; }
     if (rgbStyleEl && rgbStyleEl.parentNode) { try { rgbStyleEl.parentNode.removeChild(rgbStyleEl); } catch {} rgbStyleEl = null; }
     cancelPredictivePreTrigger('DESTROY');

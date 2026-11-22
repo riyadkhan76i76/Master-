@@ -81,6 +81,7 @@ export interface DispatchPhaseTrace {
     | 'HUMAN_HOLD_JITTER'
     | 'POINTER_UP'
     | 'POST_UP_JITTER'
+    | 'MESSAGE_CHANNEL_DISPATCH'
     | 'CLICK_COMPLETE';
   atMonoMs: number;
   deltaFromPrevMs: number;
@@ -96,12 +97,25 @@ export interface HumanMimicClickResult {
   buttonStateAfter: CashoutButtonState;
   clickX: number;
   clickY: number;
+  clickMono?: number;
+  targetMultiplierX?: number;
+  messageChannelBypassed?: boolean;
   totalDispatchMs: number;
   preJitterMs: number;
   holdJitterMs: number;
   postJitterMs: number;
   traces: DispatchPhaseTrace[];
   error?: string;
+}
+
+export interface AdaptiveRetryWindowSnapshot {
+  stuckDetected: boolean;
+  lastCheckIntervalMs: number;
+  adaptiveMaxAttempts: number;
+  adaptiveMaxDurationMs: number;
+  frequencyMultiplier: number;
+  mode: 'STANDARD' | 'ADAPTIVE_BURST' | 'CRITICAL_SUB_MS';
+  reason: string;
 }
 
 export interface BridgeStateSnapshot {
@@ -116,10 +130,16 @@ export interface BridgeStateSnapshot {
   rgbBlinkReason: string;
   rgbBlinkStartedAt: number;
   rgbBlinkTargetLabel: string;
+  toolRedBlueActive: boolean;
+  toolRedBlueReason: string;
+  toolRedBlueAdvanceMs: number;
+  toolRedBlueHorizonMs: number;
+  toolRedBlueExtraBoostMs: number;
   events: ConsolidatedTelemetryEvent[];
   totalByTransport: Record<StreamTransport, number>;
   batcher: BatcherMetrics;
   lastClickResult: HumanMimicClickResult | null;
+  adaptiveRetryWindow: AdaptiveRetryWindowSnapshot;
 }
 
 const DEFAULT_JITTER_CONFIG: HumanMimicJitterConfig = {
@@ -191,6 +211,43 @@ export function waitHumanJitterMs(ms: number): Promise<number> {
     setTimeout(() => {
       resolve(Number((nowMono() - start).toFixed(3)));
     }, Math.max(1, Math.round(ms)));
+  });
+}
+
+/**
+ * Immediate-dispatch MessageChannel trampoline that bypasses setTimeout/UI timer
+ * clamping & event queues so the final 'X' click injects at exact signal trigger time.
+ */
+export function dispatchImmediateViaMessageChannel(callback: () => void): Promise<number> {
+  const start = nowMono();
+  if (typeof MessageChannel === 'function') {
+    return new Promise((resolve) => {
+      const ch = new MessageChannel();
+      ch.port1.onmessage = () => {
+        try {
+          ch.port1.onmessage = null;
+          ch.port1.close();
+          ch.port2.close();
+        } catch {
+          // ignore
+        }
+        try {
+          callback();
+        } finally {
+          resolve(Number((nowMono() - start).toFixed(3)));
+        }
+      };
+      ch.port2.postMessage(null);
+    });
+  }
+  return new Promise((resolve) => {
+    queueMicrotask(() => {
+      try {
+        callback();
+      } finally {
+        resolve(Number((nowMono() - start).toFixed(3)));
+      }
+    });
   });
 }
 
@@ -289,7 +346,11 @@ export class ViolentmonkeyBridge {
   private rgbBlinkReason = '';
   private rgbBlinkStartedAt = 0;
   private rgbBlinkTargetLabel = '';
-  private rgbBlinkEl: HTMLElement | null = null;
+  private toolRedBlueActive = false;
+  private toolRedBlueReason = '';
+  private toolRedBlueAdvanceMs = 0;
+  private toolRedBlueHorizonMs = 0;
+  private toolRedBlueExtraBoostMs = 0;
   private rgbBlinkTimer: ReturnType<typeof setTimeout> | null = null;
   private lastClickResult: HumanMimicClickResult | null = null;
   private lastClickCoords: { x: number; y: number } | null = null;
@@ -299,6 +360,62 @@ export class ViolentmonkeyBridge {
 
   constructor(engine: TimingCalibrationEngine = timingCalibrationEngine) {
     this.timingEngine = engine;
+  }
+
+  /**
+   * Adaptive Retry Windowing:
+   * Inspects TimingCalibrationEngine's `lastCheckIntervalMs` and `latencyGuard` state.
+   * When a 'stuck' state is detected, dynamically scales retry attempt capacity and elevates
+   * sub-millisecond retry frequency instead of relying on a static retry count.
+   */
+  public computeAdaptiveRetryWindow(
+    baseMaxAttempts = this.jitterConfig.maxBtnOffAttempts,
+    baseMaxDurationMs = this.jitterConfig.maxBtnOffRetryMs,
+  ): AdaptiveRetryWindowSnapshot {
+    const snap = this.timingEngine.getSnapshot();
+    const lg = snap.latencyGuard;
+    const lastInterval = Number(snap.lastCheckIntervalMs || 0);
+    const stuckDetected = Boolean(
+      lg.stuckStateDetected ||
+        lg.lastLatencyDeltaMs > lg.thresholdMs ||
+        lg.consecutiveFrameDrops >= 2 ||
+        lastInterval > 4.0,
+    );
+
+    if (!stuckDetected) {
+      return {
+        stuckDetected: false,
+        lastCheckIntervalMs: lastInterval,
+        adaptiveMaxAttempts: baseMaxAttempts,
+        adaptiveMaxDurationMs: baseMaxDurationMs,
+        frequencyMultiplier: 1,
+        mode: 'STANDARD',
+        reason: 'Nominal frame pacing · baseline retry count',
+      };
+    }
+
+    const effectiveInterval = Math.max(lastInterval, lg.lastFrameDeltaMs > 0 ? lg.lastFrameDeltaMs * 0.35 : 4.0);
+    const driftBoost = lg.lastLatencyDeltaMs > lg.thresholdMs ? 0.6 : 0;
+    const frequencyMultiplier = Number(
+      Math.max(1.5, Math.min(4.0, effectiveInterval / 2.0 + driftBoost)).toFixed(2),
+    );
+    const adaptiveMaxAttempts = Math.min(1200, Math.max(baseMaxAttempts, Math.round(baseMaxAttempts * frequencyMultiplier)));
+    const adaptiveMaxDurationMs = Math.min(
+      2400,
+      Math.max(baseMaxDurationMs, Math.round(baseMaxDurationMs * Math.min(2.5, 1 + (frequencyMultiplier - 1) * 0.4))),
+    );
+    const mode: AdaptiveRetryWindowSnapshot['mode'] =
+      lastInterval >= 10 || lg.lastLatencyDeltaMs > lg.thresholdMs ? 'CRITICAL_SUB_MS' : 'ADAPTIVE_BURST';
+
+    return {
+      stuckDetected: true,
+      lastCheckIntervalMs: lastInterval,
+      adaptiveMaxAttempts,
+      adaptiveMaxDurationMs,
+      frequencyMultiplier,
+      mode,
+      reason: `Stuck guard active (interval=${lastInterval.toFixed(2)}ms, drift=${lg.lastLatencyDeltaMs.toFixed(1)}ms) -> ${frequencyMultiplier}x retry window (${adaptiveMaxAttempts} checks)`,
+    };
   }
 
   public subscribe(listener: (snap: BridgeStateSnapshot) => void): () => void {
@@ -333,6 +450,11 @@ export class ViolentmonkeyBridge {
       rgbBlinkReason: this.rgbBlinkReason,
       rgbBlinkStartedAt: this.rgbBlinkStartedAt,
       rgbBlinkTargetLabel: this.rgbBlinkTargetLabel,
+      toolRedBlueActive: this.toolRedBlueActive,
+      toolRedBlueReason: this.toolRedBlueReason,
+      toolRedBlueAdvanceMs: this.toolRedBlueAdvanceMs,
+      toolRedBlueHorizonMs: this.toolRedBlueHorizonMs,
+      toolRedBlueExtraBoostMs: this.toolRedBlueExtraBoostMs,
       events: this.events,
       totalByTransport: { ...this.totalByTransport },
       batcher: {
@@ -348,6 +470,7 @@ export class ViolentmonkeyBridge {
         effectiveUiHz: Number(this.effectiveUiHz.toFixed(1)),
       },
       lastClickResult: this.lastClickResult,
+      adaptiveRetryWindow: this.computeAdaptiveRetryWindow(),
     };
   }
 
@@ -377,103 +500,122 @@ export class ViolentmonkeyBridge {
     this.emitSnapshot();
   }
 
-  public startRgbBlink(
+  public startToolRedBlue(
     reason = 'CLICK',
-    el?: HTMLElement | null,
     durationMs = 25_000,
     label?: string,
+    meta?: { advanceMs?: number; horizonMs?: number; extraBoostMs?: number },
   ): void {
     if (this.rgbBlinkTimer !== null) {
       clearTimeout(this.rgbBlinkTimer);
       this.rgbBlinkTimer = null;
     }
-    if (this.rgbBlinkEl && this.rgbBlinkEl !== el) {
-      try {
-        this.rgbBlinkEl.classList.remove('tt-rgb-led-active');
-      } catch {
-        // ignore
-      }
-    }
-    if (el && el.classList) {
-      try {
-        el.classList.add('tt-rgb-led-active');
-      } catch {
-        // ignore
-      }
-      this.rgbBlinkEl = el;
-    } else if (el === null) {
-      this.rgbBlinkEl = null;
-    }
+    const preserveMeta = this.toolRedBlueActive && reason !== 'TEST';
+    const nextAdvanceMs =
+      typeof meta?.advanceMs === 'number'
+        ? Math.max(0, Math.round(meta.advanceMs))
+        : preserveMeta
+          ? this.toolRedBlueAdvanceMs
+          : 0;
+    const nextHorizonMs =
+      typeof meta?.horizonMs === 'number'
+        ? Math.max(0, Math.round(meta.horizonMs))
+        : preserveMeta
+          ? this.toolRedBlueHorizonMs
+          : 0;
+    const nextExtraBoostMs =
+      typeof meta?.extraBoostMs === 'number'
+        ? Math.max(0, Math.round(meta.extraBoostMs))
+        : preserveMeta
+          ? this.toolRedBlueExtraBoostMs
+          : 0;
     this.rgbBlinkActive = true;
     this.rgbBlinkReason = reason;
     this.rgbBlinkStartedAt = Date.now();
-    this.rgbBlinkTargetLabel =
-      label ||
-      (el?.textContent ? el.textContent.replace(/\s+/g, ' ').trim().slice(0, 32) : '') ||
-      reason;
+    this.rgbBlinkTargetLabel = label || reason;
+    this.toolRedBlueActive = true;
+    this.toolRedBlueReason = reason;
+    this.toolRedBlueAdvanceMs = nextAdvanceMs;
+    this.toolRedBlueHorizonMs = nextHorizonMs;
+    this.toolRedBlueExtraBoostMs = nextExtraBoostMs;
     const safeDuration = Math.max(200, Math.min(60_000, Math.round(durationMs)));
     this.rgbBlinkTimer = setTimeout(() => {
       this.rgbBlinkTimer = null;
-      this.stopRgbBlink('SAFETY_TIMEOUT');
+      this.stopToolRedBlue('SAFETY_TIMEOUT');
     }, safeDuration);
     this.emitSnapshot();
   }
 
-  public stopRgbBlink(reason = 'CASH', el?: HTMLElement | null): boolean {
-    const wasActive = this.rgbBlinkActive;
+  public stopToolRedBlue(reason = 'CASH'): boolean {
+    const wasActive = this.rgbBlinkActive || this.toolRedBlueActive;
     if (this.rgbBlinkTimer !== null) {
       clearTimeout(this.rgbBlinkTimer);
       this.rgbBlinkTimer = null;
     }
-    const targetToClean = el || this.rgbBlinkEl;
-    if (targetToClean && targetToClean.classList) {
-      try {
-        targetToClean.classList.remove('tt-rgb-led-active');
-      } catch {
-        // ignore
-      }
-    }
-    if (this.rgbBlinkEl && this.rgbBlinkEl !== targetToClean && this.rgbBlinkEl.classList) {
-      try {
-        this.rgbBlinkEl.classList.remove('tt-rgb-led-active');
-      } catch {
-        // ignore
-      }
-    }
-    this.rgbBlinkEl = null;
     this.rgbBlinkActive = false;
     this.rgbBlinkReason = reason;
     this.rgbBlinkStartedAt = 0;
     this.rgbBlinkTargetLabel = '';
+    this.toolRedBlueActive = false;
+    this.toolRedBlueReason = reason;
+    this.toolRedBlueAdvanceMs = 0;
+    this.toolRedBlueHorizonMs = 0;
+    this.toolRedBlueExtraBoostMs = 0;
     if (wasActive) {
       this.emitSnapshot();
     }
     return wasActive;
   }
 
+  /**
+   * Preserved method name for compatibility: illuminates ONLY the TriggerTap Tool Red/Blue LEDs,
+   * never mutating game button DOM classes or blinking the Cashout button.
+   */
+  public startRgbBlink(
+    reason = 'CLICK',
+    _el?: HTMLElement | null,
+    durationMs = 25_000,
+    label?: string,
+    meta?: { advanceMs?: number; horizonMs?: number; extraBoostMs?: number },
+  ): void {
+    this.startToolRedBlue(reason, durationMs, label, meta);
+  }
+
+  public stopRgbBlink(reason = 'CASH', _el?: HTMLElement | null): boolean {
+    return this.stopToolRedBlue(reason);
+  }
+
   private checkAutoStopRgbFromPayload(src: string, text: string): void {
-    if (!this.rgbBlinkActive) return;
+    if (!this.rgbBlinkActive && !this.toolRedBlueActive) return;
     const s = String(src || '').toUpperCase();
     const raw = String(text || '');
     if (
       s === 'CLICK' ||
       raw.includes('"RGB_BLINK_START"') ||
+      raw.includes('"TOOL_RB_START"') ||
+      raw.includes('"PRE_SIGNAL_2X"') ||
       raw.includes('"CLICK_SWITCH"') ||
       raw.includes('"AUTO_LEAD_CONFIG"')
     ) {
       return;
     }
-    if (raw.includes('"RGB_BLINK_STOP"')) {
-      this.stopRgbBlink('VM_RGB_STOP');
+    if (raw.includes('"RGB_BLINK_STOP"') || raw.includes('"TOOL_RB_STOP"')) {
+      this.stopToolRedBlue('VM_TOOL_RB_STOP');
       return;
     }
     if (
       /\b(?:CASH(?:ED|OUT)?|CASH_ACK|CASH_ACK_SYNC|TAKE_WIN|SETTLED?|CRASH(?:ED)?|ROUND_CRASH|ROUND_END|ROUND_UNLOCK)\b/i.test(
         raw,
-      )
+      ) ||
+      /(?:decision\s*not\s*processed|not\s*received\s*in\s*time|cashout\s*failed)/i.test(raw)
     ) {
-      const stopReason = /\bCRASH/i.test(raw) ? 'ROUND_CRASH' : 'GAME_CASH';
-      this.stopRgbBlink(stopReason);
+      const stopReason = /\bCRASH/i.test(raw)
+        ? 'ROUND_CRASH'
+        : /(?:decision\s*not\s*processed|not\s*received\s*in\s*time|cashout\s*failed)/i.test(raw)
+          ? 'ERR_REJECT'
+          : 'GAME_CASH';
+      this.timingEngine.setCriticalCashoutPhase(false);
+      this.stopToolRedBlue(stopReason);
     }
   }
 
@@ -710,16 +852,36 @@ export class ViolentmonkeyBridge {
           const src = String(rec.src || 'WS-IN');
           const text = String(rec.text || '');
           const transportHeader = typeof rec.transport === 'string' ? (rec.transport as StreamTransport) : undefined;
-          if (src === 'VM-BRIDGE' || src === 'CLICK' || src === 'RETRY') {
+          if (src === 'VM-BRIDGE' || src === 'CLICK' || src === 'RETRY' || src === 'PRE-SIG-2X') {
             try {
               const parsed = JSON.parse(text) as Record<string, unknown>;
-              if (parsed && parsed.event === 'RGB_BLINK_START') {
+              if (
+                parsed &&
+                (parsed.event === 'RGB_BLINK_START' ||
+                  parsed.event === 'TOOL_RB_START' ||
+                  parsed.event === 'PRE_SIGNAL_2X')
+              ) {
                 if (typeof parsed.clickEnabled === 'boolean' && parsed.clickEnabled !== this.clickEnabled) {
                   this.clickEnabled = parsed.clickEnabled;
                 }
-                this.startRgbBlink(String(parsed.reason || 'VM_CLICK'), undefined, 25_000);
-              } else if (parsed && parsed.event === 'RGB_BLINK_STOP') {
-                this.stopRgbBlink(String(parsed.reason || 'VM_STOP'));
+                const advMs =
+                  typeof parsed.advanceMs === 'number'
+                    ? parsed.advanceMs
+                    : typeof parsed.advanceAheadMs === 'number'
+                      ? parsed.advanceAheadMs
+                      : 0;
+                const horMs = typeof parsed.totalHorizonMs === 'number' ? parsed.totalHorizonMs : 0;
+                const boostMs = typeof parsed.extraBoostMs === 'number' ? parsed.extraBoostMs : 0;
+                this.timingEngine.setCriticalCashoutPhase(true);
+                this.startToolRedBlue(
+                  String(parsed.reason || parsed.event || 'VM_CLICK'),
+                  25_000,
+                  typeof parsed.tag === 'string' ? parsed.tag : undefined,
+                  { advanceMs: advMs, horizonMs: horMs, extraBoostMs: boostMs },
+                );
+              } else if (parsed && (parsed.event === 'RGB_BLINK_STOP' || parsed.event === 'TOOL_RB_STOP')) {
+                this.timingEngine.setCriticalCashoutPhase(false);
+                this.stopToolRedBlue(String(parsed.reason || 'VM_STOP'));
               }
             } catch {
               // ignore non-json VM-BRIDGE payloads
@@ -745,20 +907,82 @@ export class ViolentmonkeyBridge {
                   lastAdaptationReason: typeof parsed.reason === 'string' ? parsed.reason : undefined,
                 });
               } else if (parsed && parsed.event === 'FRAME_TO_CASHOUT') {
-                if (parsed.status === 'REJECTED') {
+                const rawRtt = typeof parsed.serverRttMs === 'number' ? parsed.serverRttMs : undefined;
+                const rawDelta =
+                  typeof parsed.latencyDeltaMs === 'number'
+                    ? parsed.latencyDeltaMs
+                    : rawRtt ?? (typeof parsed.clickToCashMs === 'number' ? parsed.clickToCashMs : 0);
+                const intendedMono =
+                  typeof parsed.intendedClickMono === 'number'
+                    ? parsed.intendedClickMono
+                    : nowMono();
+                const ackMono =
+                  typeof parsed.serverAckMono === 'number'
+                    ? parsed.serverAckMono
+                    : intendedMono + Math.max(0, rawDelta);
+                const statusStr = String(parsed.status || '');
+                if (statusStr === 'REJECTED') {
                   const errStr = String(parsed.serverVerdict || '');
                   const isRateLimit = /limit|spam|frequent|cooldown|wait/i.test(errStr);
                   this.timingEngine.recordServerClickFeedback({
                     outcome: isRateLimit ? 'RATE_LIMITED' : 'BOT_REJECTED',
-                    serverRttMs: typeof parsed.serverRttMs === 'number' ? parsed.serverRttMs : undefined,
+                    serverRttMs: rawRtt,
                     errText: errStr,
                   });
-                } else if (parsed.status === 'CASHED' || parsed.status === 'ACCEPTED') {
+                  this.timingEngine.recordLatencyDriftSample({
+                    roundId: typeof parsed.roundId === 'string' ? parsed.roundId : undefined,
+                    tag: typeof parsed.tag === 'string' ? parsed.tag : 'CASHOUT',
+                    intendedClickMono: intendedMono,
+                    serverAckMono: ackMono,
+                    latencyDeltaMs: rawDelta,
+                    outcome: 'REJECTED',
+                  });
+                } else if (statusStr === 'CASHED' || statusStr === 'ACCEPTED') {
                   this.timingEngine.recordServerClickFeedback({
                     outcome: 'ACCEPTED',
-                    serverRttMs: typeof parsed.serverRttMs === 'number' ? parsed.serverRttMs : undefined,
+                    serverRttMs: rawRtt,
                   });
+                  this.timingEngine.recordLatencyDriftSample({
+                    roundId: typeof parsed.roundId === 'string' ? parsed.roundId : undefined,
+                    tag: typeof parsed.tag === 'string' ? parsed.tag : 'CASHOUT',
+                    intendedClickMono: intendedMono,
+                    serverAckMono: ackMono,
+                    latencyDeltaMs: rawDelta,
+                    outcome: rawDelta > 50 ? 'STUCK' : 'ACCEPTED',
+                  });
+                  this.timingEngine.setCriticalCashoutPhase(false);
                   this.stopRgbBlink('CASHED');
+                } else if (statusStr === 'STUCK' || statusStr === 'MISSED' || statusStr === 'CUTOFF_MISS') {
+                  this.timingEngine.recordLatencyDriftSample({
+                    roundId: typeof parsed.roundId === 'string' ? parsed.roundId : undefined,
+                    tag: typeof parsed.tag === 'string' ? parsed.tag : 'CASHOUT',
+                    intendedClickMono: intendedMono,
+                    serverAckMono: ackMono,
+                    latencyDeltaMs: rawDelta,
+                    outcome: 'STUCK',
+                  });
+                }
+
+                const ackX =
+                  typeof parsed.serverAckX === 'number'
+                    ? parsed.serverAckX
+                    : typeof parsed.mult === 'number'
+                      ? parsed.mult
+                      : typeof parsed.x === 'number'
+                        ? parsed.x
+                        : undefined;
+                if (typeof ackX === 'number' && Number.isFinite(ackX) && ackX > 0) {
+                  this.timingEngine.verifyClickAgainstServerAckX({
+                    roundId: typeof parsed.roundId === 'string' ? parsed.roundId : undefined,
+                    tag: typeof parsed.tag === 'string' ? parsed.tag : 'CASHOUT',
+                    clickMono:
+                      typeof parsed.clickMono === 'number' ? parsed.clickMono : intendedMono,
+                    serverAckX: ackX,
+                    serverAckMono: ackMono,
+                    intendedX: typeof parsed.intendedX === 'number' ? parsed.intendedX : undefined,
+                    flightStartMono:
+                      typeof parsed.flightStartMono === 'number' ? parsed.flightStartMono : undefined,
+                  });
                 }
               }
             } catch {
@@ -1252,10 +1476,14 @@ export class ViolentmonkeyBridge {
       tag?: string;
       flightAgeMs?: number;
       forceRealClick?: boolean;
+      targetMultiplierX?: number;
+      signalTriggeredAtMono?: number;
+      bypassEventQueue?: boolean;
       jitter?: Partial<HumanMimicJitterConfig>;
     },
   ): Promise<HumanMimicClickResult> {
     const startMono = nowMono();
+    const bypassQueue = Boolean(opts?.bypassEventQueue);
     const autoProf = this.timingEngine.getAutoHumanProfile();
     const shouldAutoScale = (opts?.jitter?.autoScale ?? this.jitterConfig.autoScale) !== false && autoProf.enabled;
     const cfg: HumanMimicJitterConfig = {
@@ -1275,9 +1503,15 @@ export class ViolentmonkeyBridge {
       ...(opts?.jitter || {}),
     };
     const tag = opts?.tag || 'CASHOUT';
+    const targetMultiplierX =
+      typeof opts?.targetMultiplierX === 'number' && Number.isFinite(opts.targetMultiplierX)
+        ? opts.targetMultiplierX
+        : undefined;
     const resolveEl =
       typeof targetOrResolver === 'function' ? targetOrResolver : () => targetOrResolver;
 
+    this.timingEngine.setCriticalCashoutPhase(true);
+    try {
     const traces: DispatchPhaseTrace[] = [];
     let lastTraceMono = startMono;
     const recordTrace = (phase: DispatchPhaseTrace['phase'], detail: string) => {
@@ -1320,6 +1554,15 @@ export class ViolentmonkeyBridge {
         return failedRes;
       }
 
+      // Adaptive Retry Windowing: scale retry capacity & sub-ms frequency dynamically from lastCheckIntervalMs
+      const adaptiveWin = this.computeAdaptiveRetryWindow(
+        cfg.maxBtnOffAttempts,
+        cfg.maxBtnOffRetryMs,
+      );
+      if (adaptiveWin.stuckDetected) {
+        recordTrace('RETRY_QUEUE_WAIT', adaptiveWin.reason);
+      }
+
       // Delegate to TimingCalibrationEngine sub-millisecond recursive retry queue
       const retryResult = await new Promise<{
         el: HTMLElement | null;
@@ -1331,8 +1574,10 @@ export class ViolentmonkeyBridge {
           tag,
           target: el,
           resolveTarget: resolveEl,
-          maxAttempts: cfg.maxBtnOffAttempts,
-          maxDurationMs: cfg.maxBtnOffRetryMs,
+          maxAttempts: adaptiveWin.adaptiveMaxAttempts,
+          maxDurationMs: adaptiveWin.adaptiveMaxDurationMs,
+          adaptiveWindow: adaptiveWin.stuckDetected,
+          forceSubMsFrequency: adaptiveWin.stuckDetected,
           onReady: (activeEl, meta) => {
             resolve({
               el: activeEl,
@@ -1429,12 +1674,12 @@ export class ViolentmonkeyBridge {
     const clientY = Number((baseCy + jy).toFixed(2));
     this.lastClickCoords = { x: clientX, y: clientY };
 
-    // Always trigger extra-bright RGB LED blink on target button (even when Click Switch is OFF)
-    this.startRgbBlink(tag, el, 25_000, initialInsp.text || tag);
+    // Trigger Red/Blue alternating strobe on the TriggerTap Tool (never mutates target button DOM)
+    this.startToolRedBlue(tag, 25_000, initialInsp.text || tag);
 
-    // Master Click Switch OFF: suppress real click dispatch while keeping RGB LED active until cashout/round end
+    // Master Click Switch OFF: suppress real click dispatch while keeping Tool Red/Blue lights active until cashout/round end
     if (!this.clickEnabled && !opts?.forceRealClick) {
-      recordTrace('CLICK_COMPLETE', 'Click suppressed (Master Click Switch OFF); RGB LED blink started');
+      recordTrace('CLICK_COMPLETE', 'Click suppressed (Master Click Switch OFF); Tool Red/Blue lights started');
       const dryRunRes: HumanMimicClickResult = {
         dispatched: false,
         dryRun: true,
@@ -1458,7 +1703,7 @@ export class ViolentmonkeyBridge {
         matched: true,
         matchedTag: tag,
         retryQueueDepth: this.timingEngine.getRetryQueueDepth(),
-        text: `RGB LED active (${clientX}, ${clientY}) — click suppressed (Master Click Switch OFF)`,
+        text: `Tool Red/Blue active (${clientX}, ${clientY}) — click suppressed (Master Click Switch OFF)`,
       });
       this.emitSnapshot();
       return dryRunRes;
@@ -1510,13 +1755,15 @@ export class ViolentmonkeyBridge {
     dispatchMouse('mousemove', { buttons: 0, detail: 0 });
     recordTrace('POINTER_HOVER', `Hovered (${clientX}, ${clientY})`);
 
-    // Phase 2: Pre-down human-mimic reaction jitter + optional takeoff human-reaction floor
-    let preJitterTarget = cfg.enabled
-      ? triangularRandom(cfg.preHoverJitterMinMs, cfg.preHoverJitterMaxMs)
-      : 0;
+    // Phase 2: Pre-down human-mimic reaction jitter + optional takeoff human-reaction floor (skipped when bypassEventQueue=true)
+    let preJitterTarget =
+      cfg.enabled && !bypassQueue
+        ? triangularRandom(cfg.preHoverJitterMinMs, cfg.preHoverJitterMaxMs)
+        : 0;
     const minFlightFloor = cfg.minFlightReactionMs ?? autoProf.minFlightReactionMs;
     if (
       cfg.enabled &&
+      !bypassQueue &&
       typeof opts?.flightAgeMs === 'number' &&
       opts.flightAgeMs >= 0 &&
       opts.flightAgeMs < minFlightFloor
@@ -1524,7 +1771,10 @@ export class ViolentmonkeyBridge {
       const needed = Math.min(180, Math.max(0, minFlightFloor - opts.flightAgeMs));
       preJitterTarget = Math.max(preJitterTarget, needed);
     }
-    const actualPreJitter = await waitHumanJitterMs(preJitterTarget);
+    const actualPreJitter = preJitterTarget > 0 ? await waitHumanJitterMs(preJitterTarget) : 0;
+    if (actualPreJitter - preJitterTarget > 24) {
+      this.timingEngine.monitorFrameDrop(actualPreJitter - preJitterTarget, el);
+    }
     if (actualPreJitter > 0) {
       recordTrace('PRE_DOWN_JITTER', `Yielded ${actualPreJitter.toFixed(2)}ms before pointerdown`);
     }
@@ -1538,11 +1788,15 @@ export class ViolentmonkeyBridge {
     }
     recordTrace('POINTER_DOWN', `pointerdown pressure=${pressure}`);
 
-    // Phase 4: Human hold jitter (realistic tap contact duration)
-    const holdTarget = cfg.enabled
-      ? triangularRandom(cfg.holdDurationMinMs, cfg.holdDurationMaxMs)
-      : 0;
-    const actualHoldJitter = await waitHumanJitterMs(holdTarget);
+    // Phase 4: Human hold jitter (realistic tap contact duration; skipped when bypassEventQueue=true)
+    const holdTarget =
+      cfg.enabled && !bypassQueue
+        ? triangularRandom(cfg.holdDurationMinMs, cfg.holdDurationMaxMs)
+        : 0;
+    const actualHoldJitter = holdTarget > 0 ? await waitHumanJitterMs(holdTarget) : 0;
+    if (actualHoldJitter - holdTarget > 24) {
+      this.timingEngine.monitorFrameDrop(actualHoldJitter - holdTarget, el);
+    }
     if (actualHoldJitter > 0) {
       recordTrace('HUMAN_HOLD_JITTER', `Held contact ${actualHoldJitter.toFixed(2)}ms`);
     }
@@ -1553,20 +1807,20 @@ export class ViolentmonkeyBridge {
     dispatchMouse('mouseup', { button: 0, buttons: 0, detail: 1 });
     recordTrace('POINTER_UP', 'pointerup + mousedown/mouseup released');
 
-    // Phase 6: Post-up micro-jitter before final DOM click event
-    const postTarget = cfg.enabled
-      ? triangularRandom(cfg.postUpJitterMinMs, cfg.postUpJitterMaxMs)
-      : 0;
-    const actualPostJitter = await waitHumanJitterMs(postTarget);
-    if (actualPostJitter > 0) {
-      recordTrace('POST_UP_JITTER', `Post-up DOM queue yield ${actualPostJitter.toFixed(2)}ms`);
-    }
+    // Phase 6 & 7: Bypass timer/event queues completely and inject final 'X' click via immediate-dispatch MessageChannel
+    let clickMono = Number(nowMono().toFixed(3));
+    const actualMcDispatchMs = await dispatchImmediateViaMessageChannel(() => {
+      clickMono = Number(nowMono().toFixed(3));
+      el!.click();
+      dispatchPointer('pointerout', { buttons: 0, pressure: 0 });
+      dispatchPointer('pointerleave', { bubbles: false, buttons: 0, pressure: 0 });
+      dispatchMouse('mouseout', { buttons: 0, detail: 0 });
+    });
 
-    // Phase 7: Trigger native click & pointer leave
-    el.click();
-    dispatchPointer('pointerout', { buttons: 0, pressure: 0 });
-    dispatchPointer('pointerleave', { bubbles: false, buttons: 0, pressure: 0 });
-    dispatchMouse('mouseout', { buttons: 0, detail: 0 });
+    recordTrace(
+      'MESSAGE_CHANNEL_DISPATCH',
+      `Bypassed event queue via immediate MessageChannel in ${actualMcDispatchMs.toFixed(3)}ms (clickMono=${clickMono.toFixed(2)}ms${targetMultiplierX ? `, targetX=${targetMultiplierX.toFixed(2)}x` : ''})`,
+    );
 
     const afterInsp = inspectCashoutButtonState(el);
     const totalDispatchMs = Number((nowMono() - startMono).toFixed(3));
@@ -1580,10 +1834,13 @@ export class ViolentmonkeyBridge {
       buttonStateAfter: afterInsp.state,
       clickX: clientX,
       clickY: clientY,
+      clickMono,
+      targetMultiplierX,
+      messageChannelBypassed: true,
       totalDispatchMs,
       preJitterMs: actualPreJitter,
       holdJitterMs: actualHoldJitter,
-      postJitterMs: actualPostJitter,
+      postJitterMs: actualMcDispatchMs,
       traces,
     };
 
@@ -1594,11 +1851,74 @@ export class ViolentmonkeyBridge {
       direction: 'OUT',
       matched: true,
       matchedTag: tag,
+      monoMs: clickMono,
       retryQueueDepth: this.timingEngine.getRetryQueueDepth(),
-      text: `Human-mimic click (${clientX}, ${clientY}) pre=${actualPreJitter.toFixed(2)}ms hold=${actualHoldJitter.toFixed(2)}ms post=${actualPostJitter.toFixed(2)}ms retries=${retriesUsed}`,
+      text: `MessageChannel click (${clientX}, ${clientY}) clickMono=${clickMono.toFixed(2)}ms${targetMultiplierX ? ` targetX=${targetMultiplierX.toFixed(2)}x` : ''} mcHop=${actualMcDispatchMs.toFixed(3)}ms pre=${actualPreJitter.toFixed(2)}ms hold=${actualHoldJitter.toFixed(2)}ms retries=${retriesUsed}`,
     });
     this.emitSnapshot();
     return result;
+    } finally {
+      this.timingEngine.setCriticalCashoutPhase(false);
+    }
+  }
+
+  /**
+   * Schedules an 'X' cashout click on TimingCalibrationEngine's high-resolution
+   * performance-timer queue (pre-calculated 10ms ahead of triggerAtMono) and fires
+   * via immediate-dispatch MessageChannel without waiting on main-thread event loops.
+   */
+  public schedulePrecalculatedClickAtX(
+    targetOrResolver: HTMLElement | null | (() => HTMLElement | null),
+    params: {
+      roundId?: string;
+      tag?: string;
+      targetX: number;
+      flightStartMono: number;
+      currentX?: number;
+      sampleMono?: number;
+      growthRateK?: number;
+      useCalibratedLead?: boolean;
+      forceRealClick?: boolean;
+      onPrecalculated?: (precalcX: number, triggerAtMono: number) => void;
+      onDispatched?: (res: HumanMimicClickResult, jitterErrorMs: number) => void;
+    },
+  ): string {
+    const resolveEl =
+      typeof targetOrResolver === 'function' ? targetOrResolver : () => targetOrResolver;
+    let preWarmedEl: HTMLElement | null = null;
+
+    const { id } = this.timingEngine.enqueueXTrigger({
+      roundId: params.roundId,
+      tag: params.tag || 'CASHOUT',
+      targetX: params.targetX,
+      flightStartMono: params.flightStartMono,
+      currentX: params.currentX,
+      sampleMono: params.sampleMono,
+      growthRateK: params.growthRateK,
+      useCalibratedLead: params.useCalibratedLead,
+      onPrecalculate10ms: (item) => {
+        preWarmedEl = resolveEl();
+        this.startToolRedBlue(
+          'PRE_CALC_10MS',
+          25_000,
+          `${item.targetX.toFixed(2)}x @ -${item.preCalcAdvanceMs}ms`,
+          { advanceMs: item.preCalcAdvanceMs },
+        );
+        params.onPrecalculated?.(item.precalculatedXAtGate, item.triggerAtMono);
+      },
+      onTrigger: async ({ item, firedAtMono, jitterErrorMs }) => {
+        const res = await this.dispatchHumanMimicClick(preWarmedEl || resolveEl, {
+          tag: item.tag,
+          targetMultiplierX: item.targetX,
+          signalTriggeredAtMono: firedAtMono,
+          bypassEventQueue: true,
+          forceRealClick: params.forceRealClick,
+        });
+        params.onDispatched?.(res, jitterErrorMs);
+      },
+    });
+
+    return id;
   }
 
   public destroy(): void {

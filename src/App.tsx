@@ -26,7 +26,23 @@ import {
   Zap,
 } from 'lucide-react';
 import {
+  Area,
+  Bar,
+  CartesianGrid,
+  ComposedChart,
+  ReferenceLine,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
+import {
   AUTO_LEAD_MULTIPLIER_PRESETS,
+  LATENCY_GUARD_THRESHOLD_MS,
+  LATE_400_BASE_MS,
+  LATE_400_BOOST_MS,
+  LATE_400_MULTIPLIER,
+  computePreSignal2xWindow,
   inspectCashoutButtonState,
   timingCalibrationEngine,
   type TagLeadMode,
@@ -92,26 +108,34 @@ const INITIAL_CHECKS: SubsystemCheckResult[] = [
   },
   {
     id: 'auto-lead-calib',
-    title: 'Auto3x -> 12x Dynamic Server-Latency Lead Calibration',
+    title: 'Auto3x -> 10x Dynamic Server-Latency Lead Calibration',
     module: 'src/utils/timingEngine.ts',
     status: 'idle',
-    summary: 'Feeds server acceptance RTT, human tap duration & deficit samples and verifies dynamic scaling past 5x (up to 12x).',
+    summary: 'Feeds server acceptance RTT, human tap duration & deficit samples and verifies dynamic scaling up to 10x cap.',
     details: [],
   },
   {
     id: 'click-switch-rgb',
-    title: 'Click Switch OFF (RGB-Only) & Cash/Crash Auto-Stop',
+    title: 'Click Switch OFF + TriggerTap Tool Red/Blue Strobe & Cash/Crash Stop',
     module: 'src/utils/violentmonkeyBridge.ts + src/index.css',
     status: 'idle',
-    summary: 'Verifies Master Click Switch OFF blocks real clicks while blinking extra-bright RGB LED on target button until CASH/CRASH stops it.',
+    summary: 'Verifies Master Click Switch OFF blocks real clicks and flashes Red/Blue lights strictly on the TriggerTap Tool (not the game button) until CASH/CRASH stops them.',
     details: [],
   },
   {
     id: 'lead-modes-calibration',
-    title: 'Flexible Lead Modes: Auto + 1x..12x + Custom ms',
+    title: 'Flexible Lead Modes (Auto + 1x..10x + Custom ms) & -400ms (800×6) Boost',
     module: 'src/utils/timingEngine.ts',
     status: 'idle',
-    summary: 'Verifies manual presets (1x, 2x, 5x, 6x, 12x), custom ms locking against BOT_REJECTED clobber, and Auto fallback.',
+    summary: 'Verifies manual presets (1x..10x), +2x advance pre-signal math, consistent >=400ms post-crash detection (800ms×6 = +4800ms tool strobe boost), and custom ms locking.',
+    details: [],
+  },
+  {
+    id: 'latency-guard-adaptive',
+    title: 'Latency Guard (>50ms Force-Reflow) & Adaptive Retry Windowing',
+    module: 'src/utils/timingEngine.ts + src/utils/violentmonkeyBridge.ts',
+    status: 'idle',
+    summary: 'Monitors critical-phase frame drops, triggers aggressive force-reflow when delta > 50ms, and scales retry frequency from lastCheckIntervalMs.',
     details: [],
   },
 ];
@@ -405,20 +429,24 @@ export default function App() {
           orderedNames.includes('pointerdown') &&
           orderedNames.includes('pointerup') &&
           orderedNames.includes('click');
+        const hasMcBypass =
+          Boolean(res1.messageChannelBypassed) &&
+          typeof res1.clickMono === 'number' &&
+          res1.traces.some((tr) => tr.phase === 'MESSAGE_CHANNEL_DISPATCH');
         const hasRealisticSpan = res1.holdJitterMs >= 7 && res1.totalDispatchMs > res1.holdJitterMs;
         const coordsVaried = res1.clickX !== res2.clickX || res1.clickY !== res2.clickY;
-        const passed = res1.dispatched && res2.dispatched && hasAllCore && hasRealisticSpan && coordsVaried && escalatedUp;
+        const passed = res1.dispatched && res2.dispatched && hasAllCore && hasMcBypass && hasRealisticSpan && coordsVaried && escalatedUp;
 
         updateCheck(id, {
           status: passed ? 'pass' : 'fail',
           durationMs: Number((performance.now() - t0).toFixed(2)),
           summary: passed
-            ? `Human tap (${res1.totalDispatchMs}ms), BOT_REJECTED auto-widened hold ${profBefore.holdMinMs}→${escalatedProf.holdMinMs}ms & minFlight ${profBefore.minFlightReactionMs}→${escalatedProf.minFlightReactionMs}ms.`
-            : 'Human-mimic click chain incomplete or auto-escalation check failed.',
+            ? `MessageChannel click (${res1.postJitterMs.toFixed(2)}ms hop, ${res1.totalDispatchMs}ms total), BOT_REJECTED auto-widened hold ${profBefore.holdMinMs}→${escalatedProf.holdMinMs}ms.`
+            : 'Human-mimic MessageChannel click chain incomplete or auto-escalation check failed.',
           details: [
-            `Event order: ${orderedNames.slice(0, 7).join(' -> ')}`,
+            `Event order: ${orderedNames.slice(0, 7).join(' -> ')} (MessageChannel bypass=${String(hasMcBypass)}, clickMono=${res1.clickMono?.toFixed(2) ?? 'n/a'}ms)`,
             `Click #1 (${res1.clickX}, ${res1.clickY}) -> Click #2 (${res2.clickX}, ${res2.clickY})`,
-            `Phase durations: pre=${res1.preJitterMs.toFixed(2)}ms | hold=${res1.holdJitterMs.toFixed(2)}ms | post=${res1.postJitterMs.toFixed(2)}ms`,
+            `Phase durations: pre=${res1.preJitterMs.toFixed(2)}ms | hold=${res1.holdJitterMs.toFixed(2)}ms | mcDispatch=${res1.postJitterMs.toFixed(3)}ms`,
             `Closed-loop BOT_REJECTED escalation: hold ${profBefore.holdMinMs}-${profBefore.holdMaxMs}ms -> ${escalatedProf.holdMinMs}-${escalatedProf.holdMaxMs}ms`,
             `Button inspection post-dispatch: ${inspectCashoutButtonState(null).state} (cleaned up cleanly)`,
           ],
@@ -540,20 +568,20 @@ export default function App() {
         const passed =
           latest.calibrated &&
           latest.appliedMultiplier > 5 &&
-          latest.appliedMultiplier <= 12 &&
+          latest.appliedMultiplier <= 10 &&
           latest.measuredServerAcceptMs > 0 &&
           latest.recommendedLeadMs > 150;
         updateCheck(id, {
           status: passed ? 'pass' : 'fail',
           durationMs: Number((performance.now() - t0).toFixed(2)),
           summary: passed
-            ? `Calibrated ${latest.tag} across ${latest.sampleCount} rounds -> Auto${latest.appliedMultiplier}x lead=${latest.recommendedLeadMs}ms (server accept ${latest.measuredServerAcceptMs}ms, median deficit ${latest.medianDeficitMs}ms).`
-            : `Auto-lead calibration did not scale as expected (mult=${latest.appliedMultiplier}x, lead=${latest.recommendedLeadMs}ms).`,
+            ? `Calibrated ${latest.tag} across ${latest.sampleCount} rounds -> Auto${latest.appliedMultiplier}x lead=${latest.recommendedLeadMs}ms (capped <=10x, server accept ${latest.measuredServerAcceptMs}ms).`
+            : `Auto-lead calibration did not scale within 10x cap (mult=${latest.appliedMultiplier}x, lead=${latest.recommendedLeadMs}ms).`,
           details: [
             `Tag: ${latest.tag}`,
-            `Samples recorded: ${latest.sampleCount} -> Dynamic Multiplier stage: Auto${latest.appliedMultiplier}x (uncapped >5x up to 12x)`,
+            `Samples recorded: ${latest.sampleCount} -> Dynamic Multiplier stage: Auto${latest.appliedMultiplier}x (max 10x)`,
             `Measured server accept window: ${latest.measuredServerAcceptMs}ms · Median deficit: ${latest.medianDeficitMs}ms`,
-            `Recommended PreTrig lead: ${latest.recommendedLeadMs}ms (includes auto-human tap compensation)`,
+            `Recommended PreTrig lead: ${latest.recommendedLeadMs}ms (+2x signal @ ${latest.recommendedLeadMs * 2}ms before crash)`,
           ],
         });
       } else if (id === 'click-switch-rgb') {
@@ -573,28 +601,37 @@ export default function App() {
         });
 
         violentmonkeyBridge.setClickEnabled(false, false);
-        const offResult = await violentmonkeyBridge.dispatchHumanMimicClick(btn, { tag: 'CHECK_RGB_OFF' });
-        const hasRgbWhileOff =
-          btn.classList.contains('tt-rgb-led-active') && violentmonkeyBridge.getSnapshot().rgbBlinkActive;
+        const offResult = await violentmonkeyBridge.dispatchHumanMimicClick(btn, { tag: 'CHECK_RB_OFF' });
+        const snapOff = violentmonkeyBridge.getSnapshot();
+        const toolLightsWhileOff =
+          !btn.classList.contains('tt-rgb-led-active') &&
+          snapOff.toolRedBlueActive &&
+          snapOff.rgbBlinkActive;
 
-        // Simulate game cashout packet -> RGB blink must stop automatically
+        // Simulate game cashout packet -> Tool Red/Blue lights must stop automatically
         violentmonkeyBridge.ingestTelemetry({
           transport: 'WS',
           src: 'WS-IN',
           direction: 'IN',
           text: '{"event":"CASH","status":"CASHED","mult":2.05}',
         });
+        const snapCash = violentmonkeyBridge.getSnapshot();
         const stoppedOnCash =
-          !btn.classList.contains('tt-rgb-led-active') && !violentmonkeyBridge.getSnapshot().rgbBlinkActive;
+          !btn.classList.contains('tt-rgb-led-active') &&
+          !snapCash.toolRedBlueActive &&
+          !snapCash.rgbBlinkActive;
 
-        // Re-enable Click Switch and verify click fires + RGB activates, then CRASH stops RGB
+        // Re-enable Click Switch and verify click fires + Tool Red/Blue activates, then CRASH stops them
         violentmonkeyBridge.setClickEnabled(true, false);
         const onResult = await violentmonkeyBridge.dispatchHumanMimicClick(btn, {
-          tag: 'CHECK_RGB_ON',
+          tag: 'CHECK_RB_ON',
           jitter: { ...jitterCfg, enabled: false },
         });
-        const hasRgbWhileOn =
-          btn.classList.contains('tt-rgb-led-active') && violentmonkeyBridge.getSnapshot().rgbBlinkActive;
+        const snapOn = violentmonkeyBridge.getSnapshot();
+        const toolLightsWhileOn =
+          !btn.classList.contains('tt-rgb-led-active') &&
+          snapOn.toolRedBlueActive &&
+          snapOn.rgbBlinkActive;
 
         violentmonkeyBridge.ingestTelemetry({
           transport: 'WS',
@@ -602,8 +639,11 @@ export default function App() {
           direction: 'IN',
           text: '{"event":"CRASH","status":"ROUND_END","mult":2.41}',
         });
+        const snapCrash = violentmonkeyBridge.getSnapshot();
         const stoppedOnCrash =
-          !btn.classList.contains('tt-rgb-led-active') && !violentmonkeyBridge.getSnapshot().rgbBlinkActive;
+          !btn.classList.contains('tt-rgb-led-active') &&
+          !snapCrash.toolRedBlueActive &&
+          !snapCrash.rgbBlinkActive;
 
         violentmonkeyBridge.setClickEnabled(prevClickEnabled, false);
         host.removeChild(btn);
@@ -612,23 +652,23 @@ export default function App() {
           offResult.dryRun === true &&
           !offResult.dispatched &&
           nativeClickCount === 1 &&
-          hasRgbWhileOff &&
+          toolLightsWhileOff &&
           stoppedOnCash &&
           onResult.dispatched &&
-          hasRgbWhileOn &&
+          toolLightsWhileOn &&
           stoppedOnCrash;
 
         updateCheck(id, {
           status: passed ? 'pass' : 'fail',
           durationMs: Number((performance.now() - t0).toFixed(2)),
           summary: passed
-            ? 'Click OFF blocked DOM click (0 clicks) while blinking RGB LED; Click ON fired 1 click; CASH & CRASH stopped RGB.'
-            : `Switch/RGB check mismatch (dryRun=${Boolean(offResult.dryRun)}, clicks=${nativeClickCount}, cashStop=${stoppedOnCash}, crashStop=${stoppedOnCrash}).`,
+            ? 'Click OFF suppressed clicks while TriggerTap Tool flashed Red/Blue (game button kept clean); CASH & CRASH auto-stopped lights.'
+            : `Tool Red/Blue check mismatch (dryRun=${Boolean(offResult.dryRun)}, clicks=${nativeClickCount}, cashStop=${stoppedOnCash}, crashStop=${stoppedOnCrash}).`,
           details: [
-            `Click OFF -> dryRun=${String(offResult.dryRun)}, nativeClicksBeforeOn=${nativeClickCount === 1 ? '0 (suppressed)' : 'unexpected'}, RGB=${hasRgbWhileOff ? 'BLINKING' : 'OFF'}`,
-            `Game CASH packet -> RGB auto-stopped: ${stoppedOnCash ? 'YES' : 'NO'}`,
-            `Click ON -> dispatched=${String(onResult.dispatched)}, RGB=${hasRgbWhileOn ? 'BLINKING' : 'OFF'}`,
-            `Game CRASH packet -> RGB auto-stopped: ${stoppedOnCrash ? 'YES' : 'NO'}`,
+            `Click OFF -> dryRun=${String(offResult.dryRun)}, gameButtonUntouched=${!btn.classList.contains('tt-rgb-led-active')}, ToolRedBlue=${toolLightsWhileOff ? 'FLASHING' : 'OFF'}`,
+            `Game CASH packet -> Tool Red/Blue auto-stopped: ${stoppedOnCash ? 'YES' : 'NO'}`,
+            `Click ON -> dispatched=${String(onResult.dispatched)}, ToolRedBlue=${toolLightsWhileOn ? 'FLASHING' : 'OFF'}`,
+            `Game CRASH packet -> Tool Red/Blue auto-stopped: ${stoppedOnCrash ? 'YES' : 'NO'}`,
           ],
         });
       } else if (id === 'lead-modes-calibration') {
@@ -641,10 +681,33 @@ export default function App() {
         const m2 = timingCalibrationEngine.getEffectiveLeadForTag(tag);
         timingCalibrationEngine.setTagLeadOverride(tag, 'manual_mult', 5, 100);
         const m5 = timingCalibrationEngine.getEffectiveLeadForTag(tag);
-        timingCalibrationEngine.setTagLeadOverride(tag, 'manual_mult', 6, 100);
-        const m6 = timingCalibrationEngine.getEffectiveLeadForTag(tag);
-        timingCalibrationEngine.setTagLeadOverride(tag, 'manual_mult', 12, 100);
-        const m12 = timingCalibrationEngine.getEffectiveLeadForTag(tag);
+        timingCalibrationEngine.setTagLeadOverride(tag, 'manual_mult', 8, 100);
+        const m8 = timingCalibrationEngine.getEffectiveLeadForTag(tag);
+        timingCalibrationEngine.setTagLeadOverride(tag, 'manual_mult', 10, 100);
+        const m10 = timingCalibrationEngine.getEffectiveLeadForTag(tag);
+        timingCalibrationEngine.setTagLeadOverride(tag, 'manual_mult', 14, 100);
+        const mCapped = timingCalibrationEngine.getEffectiveLeadForTag(tag);
+
+        const sig1500 = computePreSignal2xWindow(1500);
+        const lateSample1 = timingCalibrationEngine.recordRoundTimingSample({
+          roundId: 'LATE400_R1',
+          tag: 'CHECK_LATE400',
+          flightStartMono: 1000,
+          tagArrivalMono: 2000,
+          clickMono: 2430,
+          crashMono: 2000,
+          outcome: 'LATE',
+        });
+        const lateSample2 = timingCalibrationEngine.recordRoundTimingSample({
+          roundId: 'LATE400_R2',
+          tag: 'CHECK_LATE400',
+          flightStartMono: 6000,
+          tagArrivalMono: 7000,
+          clickMono: 7465,
+          crashMono: 7000,
+          outcome: 'LATE',
+        });
+        const sigBoosted = computePreSignal2xWindow(1500, lateSample2.late400BoostMs);
 
         timingCalibrationEngine.setTagLeadOverride(tag, 'manual_ms', 6, 235);
         const profBefore = { ...timingCalibrationEngine.getAutoHumanProfile() };
@@ -661,21 +724,127 @@ export default function App() {
         const monotonicMult =
           m1.leadMs < m2.leadMs &&
           m2.leadMs < m5.leadMs &&
-          m5.leadMs < m6.leadMs &&
-          m6.leadMs < m12.leadMs;
+          m5.leadMs < m8.leadMs &&
+          m8.leadMs < m10.leadMs &&
+          mCapped.multiplier === 10;
+        const preSigOk = sig1500.totalHorizonMs === 3000 && sig1500.advanceAheadMs === 1500;
+        const late400Ok =
+          !lateSample1.late400RuleActive &&
+          lateSample2.late400RuleActive &&
+          lateSample2.late400Streak >= 2 &&
+          lateSample2.late400BoostMs === LATE_400_BOOST_MS &&
+          lateSample2.appliedMultiplier >= LATE_400_MULTIPLIER &&
+          sigBoosted.totalHorizonMs === 7800 &&
+          sigBoosted.advanceAheadMs === 6300;
         const customLocked =
           customAfterReject.mode === 'manual_ms' && customAfterReject.leadMs === 235;
-        const passed = monotonicMult && customLocked;
+        const passed = monotonicMult && preSigOk && late400Ok && customLocked;
 
         updateCheck(id, {
           status: passed ? 'pass' : 'fail',
           durationMs: Number((performance.now() - t0).toFixed(2)),
           summary: passed
-            ? `Lead scaling verified: 1x=${m1.leadMs}ms < 2x=${m2.leadMs}ms < 5x=${m5.leadMs}ms < 6x=${m6.leadMs}ms < 12x=${m12.leadMs}ms; custom 235ms locked.`
-            : 'Manual multiplier scaling or custom ms lock failed.',
+            ? `Lead 1x..10x verified, -400ms late rule armed ${LATE_400_BASE_MS}ms×${LATE_400_MULTIPLIER}=+${LATE_400_BOOST_MS}ms (horizon 7800ms), custom 235ms locked.`
+            : 'Manual 1x..10x scaling, -400ms (800×6) boost, +2x pre-signal math, or custom ms lock failed.',
           details: [
-            `Presets -> 1x:${m1.leadMs}ms · 2x:${m2.leadMs}ms · 5x:${m5.leadMs}ms · 6x:${m6.leadMs}ms · 12x:${m12.leadMs}ms`,
+            `Presets -> 1x:${m1.leadMs}ms · 2x:${m2.leadMs}ms · 5x:${m5.leadMs}ms · 8x:${m8.leadMs}ms · 10x:${m10.leadMs}ms (cap mult=${mCapped.multiplier}x)`,
+            `+2x Pre-Signal check for 1500ms -> Total horizon: ${sig1500.totalHorizonMs}ms · Tool signal ahead: -${sig1500.advanceAheadMs}ms`,
+            `-400ms Post-Crash Rule (2R >=400ms late) -> Streak:${lateSample2.late400Streak}, Boost:+${lateSample2.late400BoostMs}ms (${LATE_400_BASE_MS}×${LATE_400_MULTIPLIER}), 1500ms horizon=${sigBoosted.totalHorizonMs}ms (-${sigBoosted.advanceAheadMs}ms)`,
             `Custom ms override (235ms) after BOT_REJECTED feedback: ${customAfterReject.leadMs}ms (mode=${customAfterReject.mode})`,
+          ],
+        });
+      } else if (id === 'latency-guard-adaptive') {
+        const host = stagingHostRef.current;
+        if (!host) throw new Error('Staging host unavailable');
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'cashout_btn w-36 h-11';
+        btn.textContent = 'Cash Out 2.15x';
+        host.appendChild(btn);
+
+        const reflowsBefore = timingCalibrationEngine.getSnapshot().latencyGuard.totalForceReflows;
+        timingCalibrationEngine.setCriticalCashoutPhase(true);
+        const drop1 = timingCalibrationEngine.monitorFrameDrop(32.5, btn);
+        const drop2 = timingCalibrationEngine.monitorFrameDrop(58.4, btn);
+        const driftSample = timingCalibrationEngine.recordLatencyDriftSample({
+          roundId: 'LG_STUCK',
+          tag: 'CASHOUT',
+          intendedClickMono: 1000,
+          serverAckMono: 1084,
+          outcome: 'STUCK',
+          targetEl: btn,
+        });
+        const clickXOk = timingCalibrationEngine.verifyClickAgainstServerAckX({
+          roundId: 'LG_CX_OK',
+          tag: 'CHECK_CX_VERIF',
+          clickMono: 2000,
+          serverAckX: 2.0,
+          intendedX: 2.0,
+          serverAckMono: 2000.4,
+        });
+        const clickXDrift = timingCalibrationEngine.verifyClickAgainstServerAckX({
+          roundId: 'LG_CX_DRIFT',
+          tag: 'CHECK_CX_VERIF',
+          clickMono: 2000,
+          serverAckX: 2.04,
+          intendedX: 2.0,
+          serverAckMono: 2018.5,
+        });
+        let precalcObserved = false;
+        let precalcItemGateX = 0;
+        const triggerHook = await new Promise<{ firedAtMono: number; jitterErrorMs: number; advanceMs: number }>((resolve) => {
+          const flightStart = performance.now() - 400;
+          timingCalibrationEngine.enqueueXTrigger({
+            roundId: 'LG_PTQ_10MS',
+            tag: 'CHECK_PTQ',
+            targetX: 1.026,
+            flightStartMono: flightStart,
+            growthRateK: 0.00006,
+            onPrecalculate10ms: (item) => {
+              precalcObserved = item.stage === 'ARMED_10MS' && item.preCalcAdvanceMs === 10;
+              precalcItemGateX = item.precalculatedXAtGate;
+            },
+            onTrigger: ({ firedAtMono, jitterErrorMs, precalculatedAdvanceMs }) => {
+              resolve({ firedAtMono, jitterErrorMs, advanceMs: precalculatedAdvanceMs });
+            },
+          });
+        });
+
+        timingCalibrationEngine.setCriticalCashoutPhase(false);
+        host.removeChild(btn);
+
+        const snapAfter = timingCalibrationEngine.getSnapshot();
+        const adaptiveWin = violentmonkeyBridge.computeAdaptiveRetryWindow(300, 600);
+        const reflowDelta = snapAfter.latencyGuard.totalForceReflows - reflowsBefore;
+
+        const passed =
+          drop1.dropped &&
+          drop2.reflowTriggered &&
+          driftSample.stuckDetected &&
+          driftSample.forceReflowTriggered &&
+          reflowDelta >= 2 &&
+          adaptiveWin.stuckDetected &&
+          adaptiveWin.adaptiveMaxAttempts > 300 &&
+          !clickXOk.discrepancyExceeded &&
+          clickXDrift.discrepancyExceeded &&
+          clickXDrift.calibrationAdjustmentMs > 0 &&
+          precalcObserved &&
+          triggerHook.advanceMs === 10;
+
+        updateCheck(id, {
+          status: passed ? 'pass' : 'fail',
+          durationMs: Number((performance.now() - t0).toFixed(2)),
+          summary: passed
+            ? `10ms Perf-Timer pre-calc fired (jitter ${triggerHook.jitterErrorMs}ms); Latency Guard + Click-X calibration passed.`
+            : 'Latency Guard >50ms force-reflow, 10ms Perf-Timer pre-calc, or Click-X >1ms verification failed.',
+          details: [
+            `Critical phase frame drops: drop1=${drop1.dropped ? '32.5ms' : 'no'}, drop2=58.4ms -> force-reflow=${drop2.reflowTriggered ? 'YES' : 'NO'}`,
+            `Latency Drift sample: ${driftSample.latencyDeltaMs}ms (>50ms threshold) -> reflowTriggered=${String(driftSample.forceReflowTriggered)}`,
+            `10ms Pre-Calc Perf Queue: armed10ms=${String(precalcObserved)} (gateX=${precalcItemGateX.toFixed(4)}x, jitter=${triggerHook.jitterErrorMs}ms)`,
+            `Click-X verification: 0.4ms delta -> exceeded=${String(clickXOk.discrepancyExceeded)}; 18.5ms delta -> adjusted lead ${clickXDrift.previousLeadMs}ms -> ${clickXDrift.adjustedLeadMs}ms`,
+            `Total force-reflows delta: +${reflowDelta} (reason: ${snapAfter.latencyGuard.lastForceReflowReason})`,
+            `Adaptive Retry Window: mode=${adaptiveWin.mode}, mult=${adaptiveWin.frequencyMultiplier}x, attempts=${adaptiveWin.adaptiveMaxAttempts} (interval=${adaptiveWin.lastCheckIntervalMs.toFixed(2)}ms)`,
           ],
         });
       }
@@ -817,8 +986,108 @@ export default function App() {
     }
   };
 
+  const handleSimulatePreSignal2x = () => {
+    const effCashout = timingCalibrationEngine.getEffectiveLeadForTag('CASHOUT');
+    const activeLateTag = timingSnap.calibratedTags.find((c) => c.late400RuleActive);
+    const activeBaseLead =
+      timingSnap.globalLeadMode === 'manual_ms'
+        ? timingSnap.globalManualLeadMs
+        : effCashout.leadMs || timingSnap.globalManualLeadMs || 1500;
+    const extraBoostMs = effCashout.late400RuleActive
+      ? effCashout.late400BoostMs
+      : activeLateTag
+        ? activeLateTag.late400BoostMs
+        : 0;
+    const win2x = computePreSignal2xWindow(activeBaseLead, extraBoostMs);
+    violentmonkeyBridge.startToolRedBlue(
+      'PRE_SIG_2X',
+      25_000,
+      extraBoostMs > 0 ? `+2x +${extraBoostMs}ms (800×6)` : '+2x Signal',
+      {
+        advanceMs: win2x.advanceAheadMs,
+        horizonMs: win2x.totalHorizonMs,
+        extraBoostMs: win2x.extraBoostMs,
+      },
+    );
+    violentmonkeyBridge.ingestTelemetry({
+      transport: 'VM-BRIDGE',
+      src: 'PRE-SIG-2X',
+      direction: 'SYS',
+      matched: true,
+      matchedTag: extraBoostMs > 0 ? `+2x+${extraBoostMs}ms` : '+2x_SIGNAL',
+      text: JSON.stringify({
+        event: 'PRE_SIGNAL_2X',
+        baseLeadMs: win2x.baseLeadMs,
+        extraBoostMs: win2x.extraBoostMs,
+        totalHorizonMs: win2x.totalHorizonMs,
+        advanceMs: win2x.advanceAheadMs,
+      }),
+    });
+    violentmonkeyBridge.flushPendingBatch();
+  };
+
+  const handleSimulateLatencyDriftProbe = () => {
+    const baseMono = performance.now();
+    const nextIdx = timingSnap.latencyGuard.samples.length + 1;
+    timingCalibrationEngine.setCriticalCashoutPhase(true);
+    timingCalibrationEngine.monitorFrameDrop(29.4, previewBtnRef.current);
+    timingCalibrationEngine.monitorFrameDrop(64.2, previewBtnRef.current);
+    const sample = timingCalibrationEngine.recordLatencyDriftSample({
+      roundId: `R${nextIdx}`,
+      tag: 'CASHOUT',
+      intendedClickMono: baseMono,
+      serverAckMono: baseMono + 78.5,
+      outcome: 'STUCK',
+      targetEl: previewBtnRef.current,
+    });
+    timingCalibrationEngine.setCriticalCashoutPhase(false);
+    violentmonkeyBridge.ingestTelemetry({
+      transport: 'VM-BRIDGE',
+      src: 'LATENCY',
+      direction: 'SYS',
+      matched: true,
+      matchedTag: 'LATENCY_GUARD',
+      text: JSON.stringify({
+        event: 'LATENCY_GUARD_REFLOW',
+        roundId: sample.roundId,
+        latencyDeltaMs: sample.latencyDeltaMs,
+        forceReflowTriggered: sample.forceReflowTriggered,
+        adaptiveRetryWindow: violentmonkeyBridge.computeAdaptiveRetryWindow(),
+      }),
+    });
+    violentmonkeyBridge.flushPendingBatch();
+  };
+
   const retryDepth = timingSnap.totalRetryQueueDepth;
   const retryActive = retryDepth > 0;
+  const toolRbActive = bridgeSnap.toolRedBlueActive || bridgeSnap.rgbBlinkActive;
+  const effCashoutSnap = timingCalibrationEngine.getEffectiveLeadForTag('CASHOUT');
+  const activeLateTagSnap = timingSnap.calibratedTags.find((c) => c.late400RuleActive);
+  const activeEffLeadMs =
+    timingSnap.globalLeadMode === 'manual_ms'
+      ? timingSnap.globalManualLeadMs
+      : effCashoutSnap.leadMs || timingSnap.globalManualLeadMs;
+  const activeExtraBoostMs = effCashoutSnap.late400RuleActive
+    ? effCashoutSnap.late400BoostMs
+    : activeLateTagSnap
+      ? activeLateTagSnap.late400BoostMs
+      : 0;
+  const previewPreSig2x = computePreSignal2xWindow(activeEffLeadMs, activeExtraBoostMs);
+
+  const latencyDriftChartData = useMemo(() => {
+    return timingSnap.latencyGuard.samples.map((s, idx) => ({
+      idx: idx + 1,
+      label: s.roundId || `R${idx + 1}`,
+      latencyDeltaMs: Number(s.latencyDeltaMs.toFixed(1)),
+      intendedClickMs: Number(s.intendedClickMono.toFixed(1)),
+      serverAckMs: Number(s.serverAckMono.toFixed(1)),
+      frameDropCount: s.frameDropCount,
+      stuckDetected: s.stuckDetected,
+      forceReflowTriggered: s.forceReflowTriggered,
+      outcome: s.outcome,
+      time: s.time,
+    }));
+  }, [timingSnap.latencyGuard.samples]);
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 font-sans flex flex-col md:flex-row">
@@ -846,6 +1115,12 @@ export default function App() {
                 </div>
               </div>
             </div>
+            {toolRbActive && (
+              <div className="flex items-center gap-1.5" title="TriggerTap Tool Red/Blue Pre-Signal Active">
+                <span className="w-2.5 h-2.5 rounded-full tt-tool-lamp-red" />
+                <span className="w-2.5 h-2.5 rounded-full tt-tool-lamp-blue" />
+              </div>
+            )}
           </div>
 
           <nav className="p-3 space-y-1">
@@ -993,25 +1268,46 @@ export default function App() {
         <main className="flex-1 p-4 sm:p-6 space-y-5 max-w-[1440px] w-full mx-auto">
           {activeNav === 'monitor' && (
             <>
-              {/* Compact RGB LED & Click Switch / Lead Control Bar */}
-              <section className="border border-slate-800 rounded-lg bg-slate-900 px-4 py-3 flex flex-wrap items-center justify-between gap-3">
-                <div className="flex flex-wrap items-center gap-3">
+              {/* TriggerTap Tool Red/Blue Side-Light & Click Switch / +2x Pre-Signal Control Bar */}
+              <section
+                className={`relative overflow-hidden border rounded-lg bg-slate-900 px-5 py-3 flex flex-wrap items-center justify-between gap-3 transition-all ${
+                  toolRbActive ? 'tt-tool-rb-active border-2' : 'border-slate-800'
+                }`}
+              >
+                {/* Left & Right Red/Blue Edge Strobe Strips on the TriggerTap Tool */}
+                <span
+                  aria-hidden="true"
+                  className={`absolute left-0 top-0 bottom-0 w-1.5 transition-opacity ${
+                    toolRbActive ? 'tt-tool-lamp-red opacity-100' : 'opacity-0'
+                  }`}
+                />
+                <span
+                  aria-hidden="true"
+                  className={`absolute right-0 top-0 bottom-0 w-1.5 transition-opacity ${
+                    toolRbActive ? 'tt-tool-lamp-blue opacity-100' : 'opacity-0'
+                  }`}
+                />
+
+                <div className="flex flex-wrap items-center gap-2.5">
                   <button
                     ref={previewBtnRef}
                     type="button"
                     onClick={() => void handleTriggerPreviewCashout()}
-                    className={`px-3.5 py-1.5 rounded-md text-xs font-semibold border transition-all ${
-                      bridgeSnap.rgbBlinkActive
-                        ? 'tt-rgb-led-active bg-fuchsia-950/80 text-white border-white'
-                        : 'bg-slate-950 hover:bg-slate-800 text-slate-100 border-slate-700'
-                    }`}
+                    className="px-3.5 py-1.5 rounded-md text-xs font-semibold border bg-slate-950 hover:bg-slate-800 text-slate-100 border-slate-700 transition-colors"
                   >
                     Trigger Target Cash Out
                   </button>
                   <button
                     type="button"
+                    onClick={handleSimulatePreSignal2x}
+                    className="px-2.5 py-1.5 rounded text-xs font-mono bg-sky-950/60 hover:bg-sky-900/60 text-sky-200 border border-sky-700/60 transition-colors"
+                  >
+                    Simulate +2x Pre-Signal
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => handleSimulateGameEnd('CASH')}
-                    disabled={!bridgeSnap.rgbBlinkActive}
+                    disabled={!toolRbActive}
                     className="px-2.5 py-1.5 rounded text-xs font-mono bg-emerald-950/60 hover:bg-emerald-900/60 disabled:opacity-40 text-emerald-300 border border-emerald-700/60 transition-colors"
                   >
                     Simulate Cash Out
@@ -1019,30 +1315,58 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => handleSimulateGameEnd('CRASH')}
-                    disabled={!bridgeSnap.rgbBlinkActive}
+                    disabled={!toolRbActive}
                     className="px-2.5 py-1.5 rounded text-xs font-mono bg-rose-950/60 hover:bg-rose-900/60 disabled:opacity-40 text-rose-300 border border-rose-700/60 transition-colors"
                   >
                     Simulate Crash
                   </button>
                 </div>
 
-                <div className="flex flex-wrap items-center gap-3 text-xs font-mono">
+                <div className="flex flex-wrap items-center gap-2.5 text-xs font-mono">
                   <span
-                    className={`px-2 py-1 rounded border ${
-                      bridgeSnap.rgbBlinkActive
-                        ? 'border-fuchsia-400/70 bg-fuchsia-950/60 text-fuchsia-200 animate-pulse'
+                    className={`inline-flex items-center gap-2 px-2.5 py-1 rounded border ${
+                      toolRbActive
+                        ? 'border-sky-400/70 bg-slate-950 text-slate-100'
                         : 'border-slate-800 bg-slate-950 text-slate-400'
                     }`}
                   >
-                    RGB LED: {bridgeSnap.rgbBlinkActive ? `BLINKING (${bridgeSnap.rgbBlinkReason})` : 'IDLE'}
+                    <span
+                      className={`w-2.5 h-2.5 rounded-full ${
+                        toolRbActive ? 'tt-tool-lamp-red' : 'bg-rose-950 border border-rose-800'
+                      }`}
+                    />
+                    <span
+                      className={`w-2.5 h-2.5 rounded-full ${
+                        toolRbActive ? 'tt-tool-lamp-blue' : 'bg-sky-950 border border-sky-800'
+                      }`}
+                    />
+                    <span>
+                      Tool R/B:{' '}
+                      {toolRbActive
+                        ? `ACTIVE (${bridgeSnap.toolRedBlueReason || bridgeSnap.rgbBlinkReason}${
+                            bridgeSnap.toolRedBlueAdvanceMs > 0
+                              ? ` · -${bridgeSnap.toolRedBlueAdvanceMs}ms`
+                              : ''
+                          }${
+                            bridgeSnap.toolRedBlueExtraBoostMs > 0
+                              ? ` +${bridgeSnap.toolRedBlueExtraBoostMs}ms`
+                              : ''
+                          })`
+                        : 'IDLE'}
+                    </span>
                   </span>
                   <span className="px-2 py-1 rounded border border-slate-800 bg-slate-950 text-cyan-300">
                     Lead:{' '}
                     {timingSnap.globalLeadMode === 'auto'
-                      ? `Auto (${timingSnap.globalLeadMultiplier}x)`
+                      ? `Auto (${timingSnap.globalLeadMultiplier}x · max 10x)`
                       : timingSnap.globalLeadMode === 'manual_mult'
                         ? `${timingSnap.globalLeadMultiplier}x`
                         : `${timingSnap.globalManualLeadMs}ms`}
+                    {' · '}
+                    <span className="text-sky-300">
+                      +2x{previewPreSig2x.extraBoostMs > 0 ? `+${previewPreSig2x.extraBoostMs}ms (800×6)` : ''}:{' '}
+                      {previewPreSig2x.totalHorizonMs}ms (-{previewPreSig2x.advanceAheadMs}ms Tool)
+                    </span>
                   </span>
                 </div>
               </section>
@@ -1153,6 +1477,190 @@ export default function App() {
                     <span>avg batch: {bridgeSnap.batcher.avgBatchSize}</span>
                     <span>{bridgeSnap.batcher.effectiveUiHz.toFixed(1)} Hz</span>
                   </div>
+                </div>
+              </section>
+
+              {/* Latency Drift Chart (Intended Click vs. Server Ack Delta) + Latency Guard & Adaptive Retry Windowing */}
+              <section className="border border-slate-800 rounded-lg bg-slate-900 overflow-hidden">
+                <div className="px-4 py-3 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex flex-wrap items-center gap-2.5">
+                    <Activity className="w-4 h-4 text-cyan-400" />
+                    <h2 className="text-xs font-semibold text-slate-100 uppercase tracking-wide">
+                      Latency Drift (Intended Click → Server Ack)
+                    </h2>
+                    <span
+                      className={`px-2 py-0.5 rounded border text-[11px] font-mono ${
+                        timingSnap.latencyGuard.stuckStateDetected
+                          ? 'border-rose-500/70 bg-rose-950/60 text-rose-300'
+                          : 'border-emerald-700/70 bg-emerald-950/50 text-emerald-300'
+                      }`}
+                    >
+                      Latency Guard:{' '}
+                      {timingSnap.latencyGuard.stuckStateDetected
+                        ? `STUCK >${LATENCY_GUARD_THRESHOLD_MS}ms · REFLOW`
+                        : 'NOMINAL'}
+                    </span>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono">
+                    <span className="px-2 py-1 rounded border border-slate-800 bg-slate-950 text-slate-300 tabular-nums">
+                      Drops:{timingSnap.latencyGuard.consecutiveFrameDrops} (tot:{timingSnap.latencyGuard.totalFrameDrops})
+                    </span>
+                    <span className="px-2 py-1 rounded border border-slate-800 bg-slate-950 text-amber-300 tabular-nums">
+                      Force-Reflows:{timingSnap.latencyGuard.totalForceReflows}
+                    </span>
+                    <span
+                      className={`px-2 py-1 rounded border tabular-nums ${
+                        timingSnap.totalClickXDiscrepancies > 0
+                          ? 'border-cyan-600/60 bg-cyan-950/50 text-cyan-200'
+                          : 'border-slate-800 bg-slate-950 text-slate-400'
+                      }`}
+                      title="Click-Mono vs Server-Ack 'X' discrepancies > 1ms logged for real-time calibration"
+                    >
+                      Click-X &gt;1ms:{timingSnap.totalClickXDiscrepancies}
+                      {timingSnap.lastCalibrationAdjustmentMs !== 0
+                        ? ` (${timingSnap.lastCalibrationAdjustmentMs > 0 ? '+' : ''}${timingSnap.lastCalibrationAdjustmentMs}ms)`
+                        : ''}
+                    </span>
+                    <span
+                      className="px-2 py-1 rounded border border-slate-800 bg-slate-950 text-emerald-300 tabular-nums"
+                      title="High-resolution performance-timer queue pre-calculating next X trigger 10ms in advance"
+                    >
+                      Perf-Queue:{timingSnap.performanceTimerQueue.preCalcAdvanceMs}ms pre (active:{timingSnap.performanceTimerQueue.activeCount} · trig:{timingSnap.performanceTimerQueue.totalTriggered})
+                    </span>
+                    <span
+                      className={`px-2 py-1 rounded border tabular-nums ${
+                        bridgeSnap.adaptiveRetryWindow.stuckDetected
+                          ? 'border-amber-500/60 bg-amber-950/50 text-amber-200'
+                          : 'border-slate-800 bg-slate-950 text-cyan-300'
+                      }`}
+                      title={bridgeSnap.adaptiveRetryWindow.reason}
+                    >
+                      Retry Window:{bridgeSnap.adaptiveRetryWindow.mode} ({bridgeSnap.adaptiveRetryWindow.adaptiveMaxAttempts} ·{' '}
+                      {bridgeSnap.adaptiveRetryWindow.lastCheckIntervalMs.toFixed(2)}ms)
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleSimulateLatencyDriftProbe}
+                      className="px-2.5 py-1 rounded border border-rose-700/60 bg-rose-950/50 hover:bg-rose-900/50 text-rose-200 transition-colors"
+                    >
+                      Probe &gt;50ms Stuck
+                    </button>
+                  </div>
+                </div>
+
+                <div className="p-4">
+                  {latencyDriftChartData.length === 0 ? (
+                    <div className="h-[200px] flex flex-col items-center justify-center text-center border border-dashed border-slate-800 rounded-md bg-slate-950/50 px-4">
+                      <AlertTriangle className="w-5 h-5 text-slate-500 mb-2" />
+                      <div className="text-xs font-medium text-slate-300">
+                        No click-to-ack latency drift samples captured yet
+                      </div>
+                      <p className="text-[11px] text-slate-400 mt-1 max-w-md">
+                        Live round samples or &ldquo;Probe &gt;50ms Stuck&rdquo; will plot the millisecond delta between intended click time and server acknowledgment against the 50ms Latency Guard threshold.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="h-[220px] w-full">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <ComposedChart data={latencyDriftChartData} margin={{ top: 10, right: 18, left: 0, bottom: 4 }}>
+                          <defs>
+                            <linearGradient id="ttLatencyDriftFill" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="5%" stopColor="#06b6d4" stopOpacity={0.35} />
+                              <stop offset="95%" stopColor="#06b6d4" stopOpacity={0.02} />
+                            </linearGradient>
+                          </defs>
+                          <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} />
+                          <XAxis
+                            dataKey="label"
+                            tick={{ fill: '#94a3b8', fontSize: 11, fontFamily: 'JetBrains Mono, monospace' }}
+                            axisLine={{ stroke: '#334155' }}
+                            tickLine={false}
+                          />
+                          <YAxis
+                            unit="ms"
+                            tick={{ fill: '#94a3b8', fontSize: 11, fontFamily: 'JetBrains Mono, monospace' }}
+                            axisLine={{ stroke: '#334155' }}
+                            tickLine={false}
+                            width={52}
+                          />
+                          <Tooltip
+                            contentStyle={{
+                              backgroundColor: '#020617',
+                              borderColor: '#334155',
+                              borderRadius: '0.5rem',
+                              fontSize: '11px',
+                              fontFamily: 'JetBrains Mono, monospace',
+                              color: '#e2e8f0',
+                            }}
+                            formatter={(value: unknown, name: unknown) => {
+                              if (name === 'latencyDeltaMs') {
+                                return [`${value} ms`, 'Click→Ack Delta'];
+                              }
+                              if (name === 'frameDropCount') {
+                                return [`${value}`, 'Frame Drops'];
+                              }
+                              return [String(value), String(name)];
+                            }}
+                            labelFormatter={(_label, payload) => {
+                              const row = payload && payload[0] ? (payload[0].payload as (typeof latencyDriftChartData)[number]) : null;
+                              if (!row) return '';
+                              return `${row.label} (${row.time}) · ${row.outcome}${row.forceReflowTriggered ? ' · FORCE-REFLOW' : ''}`;
+                            }}
+                          />
+                          <ReferenceLine
+                            y={LATENCY_GUARD_THRESHOLD_MS}
+                            stroke="#f43f5e"
+                            strokeDasharray="4 4"
+                            label={{
+                              value: '50ms Guard',
+                              position: 'insideTopRight',
+                              fill: '#fda4af',
+                              fontSize: 10,
+                            }}
+                          />
+                          <Bar
+                            dataKey="frameDropCount"
+                            fill="#f59e0b"
+                            opacity={0.45}
+                            barSize={10}
+                            radius={[2, 2, 0, 0]}
+                          />
+                          <Area
+                            type="monotone"
+                            dataKey="latencyDeltaMs"
+                            stroke="#22d3ee"
+                            strokeWidth={2}
+                            fill="url(#ttLatencyDriftFill)"
+                            dot={(dotProps) => {
+                              const { cx, cy, payload, index } = dotProps as {
+                                cx?: number;
+                                cy?: number;
+                                payload?: { stuckDetected?: boolean };
+                                index?: number;
+                              };
+                              if (typeof cx !== 'number' || typeof cy !== 'number') {
+                                return <g key={`dot_empty_${index ?? 0}`} />;
+                              }
+                              const isStuck = Boolean(payload?.stuckDetected);
+                              return (
+                                <circle
+                                  key={`dot_${index ?? 0}`}
+                                  cx={cx}
+                                  cy={cy}
+                                  r={isStuck ? 5 : 3.5}
+                                  fill={isStuck ? '#f43f5e' : '#10b981'}
+                                  stroke="#020617"
+                                  strokeWidth={1.5}
+                                />
+                              );
+                            }}
+                            activeDot={{ r: 6, stroke: '#e2e8f0', strokeWidth: 1.5 }}
+                          />
+                        </ComposedChart>
+                      </ResponsiveContainer>
+                    </div>
+                  )}
                 </div>
               </section>
 
@@ -1753,7 +2261,7 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Master Click Switch & Flexible Lead Timing (Auto + 1x..12x + Custom ms + Per-Tag) */}
+              {/* Master Click Switch & Flexible Lead Timing (Auto 1x..10x + Custom ms + +2x Pre-Signal) */}
               <div className="border-t border-slate-800 pt-5 grid grid-cols-1 lg:grid-cols-2 gap-6">
                 <div className="space-y-4">
                   <div className="flex items-center justify-between gap-2">
@@ -1769,7 +2277,7 @@ export default function App() {
                           : 'bg-amber-950/70 border-amber-500/70 text-amber-300'
                       }`}
                     >
-                      {bridgeSnap.clickEnabled ? 'Click Switch: ON' : 'Click Switch: OFF (RGB Only)'}
+                      {bridgeSnap.clickEnabled ? 'Click Switch: ON' : 'Click Switch: OFF (Tool R/B Only)'}
                     </button>
                   </div>
 
@@ -1786,7 +2294,7 @@ export default function App() {
                           : 'bg-slate-950 text-slate-300 border-slate-800 hover:border-slate-700'
                       }`}
                     >
-                      Auto (3x→12x)
+                      Auto (3x→10x)
                     </button>
                     {AUTO_LEAD_MULTIPLIER_PRESETS.map((mult) => {
                       const active = leadModeInput === 'manual_mult' && leadMultInput === mult;
@@ -1864,7 +2372,7 @@ export default function App() {
                       className="px-2.5 py-1.5 rounded bg-slate-950 border border-slate-800 text-xs font-mono text-slate-100"
                     >
                       <option value="auto">Auto</option>
-                      <option value="manual_mult">Multiplier (1x-12x)</option>
+                      <option value="manual_mult">Multiplier (1x-10x)</option>
                       <option value="manual_ms">Custom ms</option>
                     </select>
                     {overrideModeInput === 'manual_mult' ? (
@@ -1951,8 +2459,8 @@ export default function App() {
                   <h2 className="text-sm font-semibold text-slate-100">
                     TriggerTap Violentmonkey Script (Lag-Fixed + Upgraded)
                   </h2>
-                  <p className="text-xs text-slate-400 mt-0.5">
-                    Every original subsystem is intact. Includes zero-spin non-blocking click holds, native &lt;button&gt; + React onClick cashout fallback, dynamic server-RTT Auto3x→12x lead scaling, sub-ms btn_off retry + RQ HUD, Fetch/XHR/WS tagging, and batched GM bridge.
+                    <p className="text-xs text-slate-400 mt-0.5">
+                    Every original subsystem is intact. Includes fast-path 0ms cashout (no hidden anti-bot waits in Turbo 0ms), 4-level React handler + HTTP replay fallback, Auto3x→10x lead scaling, +2x advance tool signal, and alternating Red/Blue lights strictly on the TriggerTap HUD tool.
                   </p>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
@@ -1983,21 +2491,21 @@ export default function App() {
 
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 text-xs">
                 <div className="p-3 rounded bg-slate-950 border border-slate-800 space-y-1">
-                  <div className="font-mono text-amber-300 font-semibold">1. Zero-Freeze Retry &amp; Cashout Fix</div>
+                  <div className="font-mono text-amber-300 font-semibold">1. Anti-Stuck Cashout &amp; Deadlock Recovery</div>
                   <div className="text-slate-400">
-                    Replaces tight spin-loops with clean non-blocking holds, scopes retry observation to button parent, and ensures <span className="font-mono text-slate-200">&lt;button&gt;.click()</span> + React <span className="font-mono text-slate-200">onClick</span> fire whenever WS cashout hasn&apos;t left.
+                    Bypasses 125–180ms delays in Zero-Delay 0ms mode, walks 4 React ancestor layers + HTTP cashout replay, and auto-unlocks round locks if no OUT_CASH leaves.
                   </div>
                 </div>
                 <div className="p-3 rounded bg-slate-950 border border-slate-800 space-y-1">
-                  <div className="font-mono text-emerald-300 font-semibold">2. Dynamic Auto3x→12x Server Lead</div>
+                  <div className="font-mono text-emerald-300 font-semibold">2. Auto3x→10x Cap &amp; +2x Pre-Signal</div>
                   <div className="text-slate-400">
-                    Measures actual server cashout acceptance latency + deficit across rounds and automatically scales predictive lead past <span className="font-mono text-slate-200">5x</span> up to <span className="font-mono text-slate-200">12x</span>.
+                    Scales predictive Auto lead up to <span className="font-mono text-slate-200">10x</span> and adds a <span className="font-mono text-slate-200">+2x</span> pre-signal horizon (e.g. 1500ms lead signals at 3000ms before crash).
                   </div>
                 </div>
                 <div className="p-3 rounded bg-slate-950 border border-slate-800 space-y-1">
-                  <div className="font-mono text-cyan-300 font-semibold">3. Human-Mimic Jitter &amp; Lag Fixes</div>
+                  <div className="font-mono text-cyan-300 font-semibold">3. TriggerTap Tool Red/Blue Strobe Lights</div>
                   <div className="text-slate-400">
-                    Caches live polled buttons, throttles shadow-DOM scans, batches GM bridge pushes, and wraps dispatches with realistic micro-jitter delays.
+                    Removes all blinking/outlines from the game Cashout button and renders alternating Red &amp; Blue side strips + header LEDs directly on the TriggerTap Tool.
                   </div>
                 </div>
               </div>

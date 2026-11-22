@@ -5,36 +5,65 @@
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
-@keyframes ttRgbLedPulse {
-  0% {
+@keyframes ttToolRbBorder {
+  0%, 46% {
     border-color: #ff1744;
-    box-shadow: 0 0 18px 4px rgba(255, 23, 68, 0.95), 0 0 38px 9px rgba(255, 23, 68, 0.72), inset 0 0 14px rgba(255, 255, 255, 0.8);
+    box-shadow: -6px 0 22px rgba(255, 23, 68, 0.85), 6px 0 12px rgba(0, 176, 255, 0.25), 0 0 28px rgba(255, 23, 68, 0.55);
   }
-  20% {
-    border-color: #ffea00;
-    box-shadow: 0 0 18px 4px rgba(255, 234, 0, 0.95), 0 0 38px 9px rgba(255, 234, 0, 0.72), inset 0 0 14px rgba(255, 255, 255, 0.8);
-  }
-  40% {
-    border-color: #00ff88;
-    box-shadow: 0 0 18px 4px rgba(0, 255, 136, 0.95), 0 0 38px 9px rgba(0, 255, 136, 0.72), inset 0 0 14px rgba(255, 255, 255, 0.8);
-  }
-  60% {
-    border-color: #00e5ff;
-    box-shadow: 0 0 18px 4px rgba(0, 229, 255, 0.95), 0 0 38px 9px rgba(0, 229, 255, 0.72), inset 0 0 14px rgba(255, 255, 255, 0.8);
-  }
-  80% {
-    border-color: #d500f9;
-    box-shadow: 0 0 18px 4px rgba(213, 0, 249, 0.95), 0 0 38px 9px rgba(213, 0, 249, 0.72), inset 0 0 14px rgba(255, 255, 255, 0.8);
+  50%, 96% {
+    border-color: #00b0ff;
+    box-shadow: 6px 0 22px rgba(0, 176, 255, 0.88), -6px 0 12px rgba(255, 23, 68, 0.25), 0 0 28px rgba(0, 176, 255, 0.55);
   }
   100% {
     border-color: #ff1744;
-    box-shadow: 0 0 18px 4px rgba(255, 23, 68, 0.95), 0 0 38px 9px rgba(255, 23, 68, 0.72), inset 0 0 14px rgba(255, 255, 255, 0.8);
+    box-shadow: -6px 0 22px rgba(255, 23, 68, 0.85), 6px 0 12px rgba(0, 176, 255, 0.25), 0 0 28px rgba(255, 23, 68, 0.55);
   }
 }
 
-.tt-rgb-led-active {
-  outline: 3px solid #ffffff !important;
-  outline-offset: 2px !important;
-  filter: brightness(1.68) saturate(2.25) contrast(1.16) !important;
-  animation: ttRgbLedPulse 0.28s linear infinite !important;
+@keyframes ttToolLampRed {
+  0%, 48% {
+    opacity: 1;
+    background-color: #ff1744;
+    box-shadow: 0 0 14px 3px rgba(255, 23, 68, 0.95), 0 0 28px 6px rgba(255, 23, 68, 0.65);
+  }
+  50%, 98% {
+    opacity: 0.22;
+    background-color: #7f1d1d;
+    box-shadow: none;
+  }
+  100% {
+    opacity: 1;
+    background-color: #ff1744;
+    box-shadow: 0 0 14px 3px rgba(255, 23, 68, 0.95), 0 0 28px 6px rgba(255, 23, 68, 0.65);
+  }
+}
+
+@keyframes ttToolLampBlue {
+  0%, 48% {
+    opacity: 0.22;
+    background-color: #0c4a6e;
+    box-shadow: none;
+  }
+  50%, 98% {
+    opacity: 1;
+    background-color: #00b0ff;
+    box-shadow: 0 0 14px 3px rgba(0, 176, 255, 0.95), 0 0 28px 6px rgba(0, 176, 255, 0.65);
+  }
+  100% {
+    opacity: 0.22;
+    background-color: #0c4a6e;
+    box-shadow: none;
+  }
+}
+
+.tt-tool-rb-active {
+  animation: ttToolRbBorder 0.36s linear infinite !important;
+}
+
+.tt-tool-lamp-red {
+  animation: ttToolLampRed 0.36s linear infinite !important;
+}
+
+.tt-tool-lamp-blue {
+  animation: ttToolLampBlue 0.36s linear infinite !important;
 }
